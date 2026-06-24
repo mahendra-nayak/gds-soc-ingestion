@@ -71,12 +71,13 @@ class SourceFile:
     path: Path
     folder: str
     connector: str | None
-    direction: str | None          # REQ / RESP / audit
+    direction: str | None          # REQ / RESP / None
     step: int | None
-    app_id_raw: str | None
-    sequence_id: str | None
+    app_id_raw: str | None         # str — IC-3 / INV-07; None if unclassified
+    sequence_id: str | None        # str — IC-3
     payload: Any = None            # populated after parse
     raw_bytes: bytes | None = None
+    geography: str | None = None   # USA | CAN | None (unclassified / unrecognised)
 
 
 @dataclass
@@ -131,25 +132,65 @@ def build_manifest(root: Path, cfg: ClientConfig) -> list[SourceFile]:
     return files
 
 
-def _classify_file(p: Path, folder: str, cfg: ClientConfig) -> SourceFile:
-    """Pull connector/direction/step/app_id/seq out of the filename or path.
+_VALID_GEOS: frozenset[str] = frozenset({"CAN", "USA"})
 
-    Filename conventions differ per client; this reads the regex(es) the team
-    declared in config rather than hardcoding any one client's scheme.
+# Direction aliases accepted from filenames (case-insensitive)
+_DIRECTION_MAP: dict[str, str] = {
+    "request": "REQ", "req": "REQ",
+    "response": "RESP", "resp": "RESP",
+}
+
+
+def _classify_file(p: Path, folder: str, cfg: ClientConfig) -> SourceFile:
+    """Extract identity fields from one filename using the config-declared regex.
+
+    Single purpose: filename token parsing → SourceFile field population.
+    CQ-001: conditional nesting ≤ 2 levels.
+
+    INV-07: app_id_raw built as VARCHAR string — no numeric cast at any stage.
+    INV-10: geography set only from explicit geo token; never inferred from payload.
+    Amendment A1: no-match files flagged for quarantine, not silently dropped.
     """
     sf = SourceFile(path=p, folder=folder, connector=None, direction=None,
                     step=None, app_id_raw=None, sequence_id=None)
     appid_cfg = cfg["application_id"]
-    if appid_cfg["source"] == "filename_tokens":
-        m = re.match(appid_cfg["filename"]["pattern"], p.name)
-        if m:
-            gd = m.groupdict()
-            sf.connector = gd.get("connector")
-            groups = appid_cfg["filename"]["canonical_app_id_groups"]
-            sf.app_id_raw = "".join(gd.get(g, "") for g in groups)
-    # direction/step often live in the filename or the GDS envelope; the team
-    # extends this per their convention.
-    # TODO(team): set sf.direction / sf.step / sf.sequence_id from convention.
+    if appid_cfg["source"] != "filename_tokens":
+        return sf
+
+    m = re.match(appid_cfg["filename"]["pattern"], p.name, re.IGNORECASE)
+    if not m:
+        # Amendment A1: warn; dispatcher will quarantine with 'filename_parse_failed'
+        log.warning("UNCLASSIFIED file=%s — will be quarantined by dispatcher", p.name)
+        return sf  # app_id_raw=None, geography=None
+
+    gd = m.groupdict()
+
+    # connector
+    sf.connector = gd.get("connector")
+
+    # direction — normalise to REQ | RESP | None
+    sf.direction = _DIRECTION_MAP.get((gd.get("direction") or "").lower())
+
+    # sequence_id — str, never cast to int (IC-3)
+    sf.sequence_id = gd.get("sequence_id") or None
+
+    # step
+    sf.step = int(gd["step"]) if gd.get("step") else None
+
+    # app_id_raw — VARCHAR string concatenation (INV-07 / IC-3)
+    debtor = gd.get("debtor", "")
+    dt = gd.get("dt", "")
+    test_suffix = "_test" if gd.get("test") else ""
+    sf.app_id_raw = debtor + "_" + dt + test_suffix  # str — never numeric
+
+    # geography — INV-10: explicit token only; no payload inference
+    geo = (gd.get("geo") or "").upper()
+    if geo in _VALID_GEOS:
+        sf.geography = geo
+    else:
+        log.warning("UNRECOGNISED geo=%r in file=%s — geography set to None", geo, p.name)
+        sf.geography = None
+
     return sf
 
 
