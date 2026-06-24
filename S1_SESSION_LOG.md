@@ -68,7 +68,7 @@
 |---------|-----------|--------|--------|
 | 1.1 | Repository Scaffold | Completed | 5edb754, b752012, da3addb, de19971 |
 | 1.2 | Sample ZIP Fixture + Manifest Smoke Test | Completed | 04b2d5d |
-| 1.3 | Filename Parser: App ID, Geo, Connector, Sequence | | |
+| 1.3 | Filename Parser: App ID, Geo, Connector, Sequence | Completed | 15eb12e |
 | 1.4 | Geo Dispatcher | | |
 | 1.5 | Wire dispatch_by_geo() into run_pipeline() | | |
 

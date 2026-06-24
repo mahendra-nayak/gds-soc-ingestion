@@ -127,13 +127,13 @@ Source: EXECUTION_PLAN.md Session 1
 
 | Case | Scenario | Expected | UI Tests | Result |
 |------|----------|----------|----------|--------|
-| TC-1 | Standard USA filename | `geo=USA`, `debtor=500249966`, `connector=C225334`, `direction=REQ`, `app_id_raw` is VARCHAR string | N/A | |
-| TC-2 | Standard CAN filename | `geo=CAN`, correct debtor, connector, direction extracted | N/A | |
-| TC-3 | `_test` suffix filename | `app_id_raw` contains `_test` literal; `geography` correct | N/A | |
-| TC-4 | Unrecognised geo token (e.g. `MEX`) | `sf.geography = None`; no exception raised; WARNING logged | N/A | |
-| TC-5 | Filename not matching pattern at all | `sf.geography = None`; `sf.app_id_raw = None`; WARNING logged; no exception | N/A | |
-| TC-6 | `debtor_number` never cast to int | `type(sf.app_id_raw) == str` confirmed | N/A | |
-| TC-7 | pytest run passes | `pytest tests/unit/test_classifier.py -v` exits 0 | N/A | |
+| TC-1 | Standard USA filename | `geo=USA`, `debtor=500249966`, `connector=C225334`, `direction=REQ`, `app_id_raw` is VARCHAR string | N/A | PASS |
+| TC-2 | Standard CAN filename | `geo=CAN`, correct debtor, connector, direction extracted | N/A | PASS |
+| TC-3 | `_test` suffix filename | `app_id_raw` contains `_test` literal; `geography` correct | N/A | PASS |
+| TC-4 | Unrecognised geo token (e.g. `MEX`) | `sf.geography = None`; no exception raised; WARNING logged | N/A | PASS |
+| TC-5 | Filename not matching pattern at all | `sf.geography = None`; `sf.app_id_raw = None`; WARNING logged; no exception | N/A | PASS |
+| TC-6 | `debtor_number` never cast to int | `type(sf.app_id_raw) == str` confirmed | N/A | PASS |
+| TC-7 | pytest run passes | `pytest tests/unit/test_classifier.py -v` exits 0 | N/A | PASS — 24 passed in 0.32s |
 
 ### Prediction Statement
 [LEAVE BLANK — engineer writes predictions before running verification commands]
@@ -184,7 +184,7 @@ No BCE artifact impact.
 [ ] Code review complete (if invariant-touching)
 [ ] Scope decisions documented
 
-**Status:** 
+**Status:** PASS
 
 ---
 
@@ -333,7 +333,7 @@ No BCE artifact impact.
 |------|---------|--------|
 | 1.1 Repository Scaffold | CLEAN | PASS |
 | 1.2 Sample ZIP Fixture + Manifest Smoke Test | CLEAN | PASS |
-| 1.3 Filename Parser | | |
+| 1.3 Filename Parser | CLEAN | PASS |
 | 1.4 Geo Dispatcher | | |
 | 1.5 Wire dispatch_by_geo() into run_pipeline() | | |
 
