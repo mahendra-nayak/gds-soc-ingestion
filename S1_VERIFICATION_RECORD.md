@@ -195,12 +195,12 @@ Source: EXECUTION_PLAN.md Session 1
 
 | Case | Scenario | Expected | UI Tests | Result |
 |------|----------|----------|----------|--------|
-| TC-1 | 5 USA files + 3 CAN files | `partitions['USA']` has 5 files; `partitions['CAN']` has 3 files | N/A | |
-| TC-2 | File with `geography=None` | File does not appear in either partition; QUARANTINE error logged | N/A | |
-| TC-3 | Empty file list | Returns `{'USA': [], 'CAN': []}` — no KeyError, no exception | N/A | |
-| TC-4 | Unclassified file (`app_id_raw=None`, `geography=None`) | Collected into unroutable; logged; not silently dropped | N/A | |
-| TC-5 | Geography never inferred from connector or payload | Mock payload with geo hint; confirm dispatch uses only `sf.geography` field | N/A | |
-| TC-6 | pytest run passes | `pytest tests/unit/test_dispatcher.py -v` exits 0 | N/A | |
+| TC-1 | 5 USA files + 3 CAN files | `partitions['USA']` has 5 files; `partitions['CAN']` has 3 files | N/A | PASS |
+| TC-2 | File with `geography=None` | File does not appear in either partition; QUARANTINE error logged | N/A | PASS |
+| TC-3 | Empty file list | Returns `{'USA': [], 'CAN': []}` — no KeyError, no exception | N/A | PASS |
+| TC-4 | Unclassified file (`app_id_raw=None`, `geography=None`) | Collected into unroutable; logged; not silently dropped | N/A | PASS |
+| TC-5 | Geography never inferred from connector or payload | Mock payload with geo hint; confirm dispatch uses only `sf.geography` field | N/A | PASS — unrecognised geo (MEX) excluded from both partitions |
+| TC-6 | pytest run passes | `pytest tests/unit/test_dispatcher.py -v` exits 0 | N/A | PASS — 14 passed in 0.32s |
 
 ### Prediction Statement
 [LEAVE BLANK — engineer writes predictions before running verification commands]
@@ -252,7 +252,7 @@ No BCE artifact impact.
 [ ] Code review complete (if invariant-touching)
 [ ] Scope decisions documented
 
-**Status:** 
+**Status:** PASS
 
 ---
 
@@ -334,7 +334,7 @@ No BCE artifact impact.
 | 1.1 Repository Scaffold | CLEAN | PASS |
 | 1.2 Sample ZIP Fixture + Manifest Smoke Test | CLEAN | PASS |
 | 1.3 Filename Parser | CLEAN | PASS |
-| 1.4 Geo Dispatcher | | |
+| 1.4 Geo Dispatcher | CLEAN | PASS |
 | 1.5 Wire dispatch_by_geo() into run_pipeline() | | |
 
 **Session integration check result:**
