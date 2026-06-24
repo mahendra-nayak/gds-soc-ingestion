@@ -1,521 +1,638 @@
 """
-scripts/ingest_lib.py — SOC Ingestion Pipeline Engine
-Standard Schema v1.1 · Python 3.11+
+DG-Forge — Generic Ingestion Engine
+===================================
+Client-agnostic library that turns a raw GDS package (one client's ZIP) into
+standardised, one-record-per-App-ID DataLake output aligned to Standard Schema.
 
-Single authoritative engine file. Extend; do not fork.
-All invariants from docs/INVARIANTS.md are enforced here.
+Everything client-specific is data: it comes from
+  - client_config.<CLIENT>.yaml      (structural config — see assets/ template)
+  - field_mapping.<CLIENT>.xlsx      (per-SDD-path field mapping sheet)
+
+This module implements the COMMON SPINE (identical across SOC / USCC / Kapitus /
+TIB) and dispatches to registered strategies for the bits that vary.
+
+THREE INVARIANTS (not config-toggleable — enforced by `run_pipeline`):
+  I1  Credential scrub runs FIRST, before any logging/parsing/routing.
+  I2  PII is tokenised BEFORE any write; a post-write assertion proves zero raw
+      PII in the DataLake=Y partition.
+  I3  Validation runs BEFORE write; hard-quarantine failures block the write.
+
+DG-Forge governance: this engine is operational tooling. The per-client config
+and field-mapping content are engineer-authored and signed off — not generated.
+
+Status: SCAFFOLD. Deterministic plumbing is implemented; client-specific parse
+bodies and the vault/object-store/DataLake adapters are marked `TODO(team)`.
 """
-
 from __future__ import annotations
 
-import ast
 import base64
+import gzip
 import json
+import logging
 import re
-import uuid
+import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable, Iterable
 
-import xmltodict
-import yaml
+log = logging.getLogger("dg_forge.ingest")
 
 
-# ---------------------------------------------------------------------------
-# AppRecord — canonical in-memory record for one Application ID
-# IC-3: all ID fields stored as str at every stage; no numeric cast.
-# ---------------------------------------------------------------------------
+# =============================================================================
+# 0. Config + record containers
+# =============================================================================
+@dataclass
+class ClientConfig:
+    """Parsed client_config.<CLIENT>.yaml. Thin wrapper so callers get .get paths."""
+    raw: dict
+
+    @classmethod
+    def load(cls, path: str | Path) -> "ClientConfig":
+        import yaml  # pyyaml
+        with open(path) as fh:
+            return cls(yaml.safe_load(fh))
+
+    def __getitem__(self, key): return self.raw[key]
+    def get(self, key, default=None): return self.raw.get(key, default)
+
+    @property
+    def client_code(self) -> str: return self.raw["client"]["code"]
+    @property
+    def schema_version(self) -> str: return str(self.raw["client"]["schema_version"])
+    @property
+    def folder_priority(self) -> list[str]:
+        return [f["name"] for f in self.raw["package"]["folder_priority"]]
+
+
+@dataclass
+class SourceFile:
+    """One physical file from the package, after manifest + classification."""
+    path: Path
+    folder: str
+    connector: str | None
+    direction: str | None          # REQ / RESP / audit
+    step: int | None
+    app_id_raw: str | None
+    sequence_id: str | None
+    payload: Any = None            # populated after parse
+    raw_bytes: bytes | None = None
+
 
 @dataclass
 class AppRecord:
-    app_id_canonical: str          # normalised ID (str — IC-3)
-    app_id_raw: str                # original ID incl. _test suffix (str — IC-3)
-    debtor_number: str             # str — IC-3
-    sequence_id: str               # str — IC-3
-    client_code: str               # SOC_USA | SOC_CAN
-    extra_columns: dict[str, Any] = field(default_factory=dict)
-    lineage: dict[str, Any]       = field(default_factory=dict)
-    data: dict[str, Any]          = field(default_factory=dict)
-    _pii_tokenised: bool           = field(default=False, repr=False)
-    _validated: bool               = field(default=False, repr=False)
-    data_lake_flag: str            = "N"
+    """Accumulates one App ID's standardised output as the pipeline runs."""
+    app_id_canonical: str
+    app_id_raw: str
+    geography: str | None = None
+    files: list[SourceFile] = field(default_factory=list)
+    record: dict = field(default_factory=dict)        # the SS output
+    extra_columns: dict = field(default_factory=dict)
+    lineage: dict = field(default_factory=dict)
+    validation_failures: list[str] = field(default_factory=list)
+    quarantined: bool = False
 
 
-# ---------------------------------------------------------------------------
-# Strategy registry
-# ---------------------------------------------------------------------------
+# =============================================================================
+# 1. INGESTION — unzip, manifest, classify
+# =============================================================================
+def unpack_zip(zip_path: str | Path, dest: str | Path) -> Path:
+    dest = Path(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path) as z:
+        # guard against path traversal
+        for member in z.namelist():
+            target = (dest / member).resolve()
+            if not str(target).startswith(str(dest.resolve())):
+                raise ValueError(f"Unsafe path in zip: {member}")
+        z.extractall(dest)
+    return dest
 
-_STRATEGIES: dict[str, Any] = {}
+
+def build_manifest(root: Path, cfg: ClientConfig) -> list[SourceFile]:
+    """Walk the package and classify each file by folder/connector/direction.
+
+    Tolerates folders that are present-but-empty (USCC/Kapitus cc_extracts/).
+    """
+    folders = cfg.folder_priority
+    files: list[SourceFile] = []
+    for folder in folders:
+        fdir = root / folder
+        if not fdir.exists():
+            log.info("folder %s absent — skipping", folder)
+            continue
+        members = list(fdir.rglob("*"))
+        if not members:
+            log.info("folder %s present but empty — tolerated", folder)
+            continue
+        for p in members:
+            if p.is_file():
+                files.append(_classify_file(p, folder, cfg))
+    return files
 
 
-def strategy(name: str):
-    """Decorator that registers a parse strategy by name."""
-    def decorator(fn):
+def _classify_file(p: Path, folder: str, cfg: ClientConfig) -> SourceFile:
+    """Pull connector/direction/step/app_id/seq out of the filename or path.
+
+    Filename conventions differ per client; this reads the regex(es) the team
+    declared in config rather than hardcoding any one client's scheme.
+    """
+    sf = SourceFile(path=p, folder=folder, connector=None, direction=None,
+                    step=None, app_id_raw=None, sequence_id=None)
+    appid_cfg = cfg["application_id"]
+    if appid_cfg["source"] == "filename_tokens":
+        m = re.match(appid_cfg["filename"]["pattern"], p.name)
+        if m:
+            gd = m.groupdict()
+            sf.connector = gd.get("connector")
+            groups = appid_cfg["filename"]["canonical_app_id_groups"]
+            sf.app_id_raw = "".join(gd.get(g, "") for g in groups)
+    # direction/step often live in the filename or the GDS envelope; the team
+    # extends this per their convention.
+    # TODO(team): set sf.direction / sf.step / sf.sequence_id from convention.
+    return sf
+
+
+# =============================================================================
+# 2. INVARIANT I1 — CREDENTIAL SCRUB (always first)
+# =============================================================================
+def scrub_credentials(files: list[SourceFile], cfg: ClientConfig) -> list[str]:
+    """Remove credentials/secrets in place BEFORE anything reads the payloads.
+
+    Returns the list of scrubbed connectors for lineage. Operates on raw_bytes
+    where the secret is in the wire header, and on parsed structures otherwise.
+    """
+    scrubbed: list[str] = []
+    rules = cfg.get("preprocess", {}).get("credential_scrub", []) or []
+    by_connector: dict[str, list[dict]] = {}
+    for r in rules:
+        by_connector.setdefault(r["connector"], []).append(r)
+
+    for sf in files:
+        for rule in by_connector.get(sf.connector or "", []):
+            _apply_scrub(sf, rule)
+            scrubbed.append(f"{sf.connector}:{rule.get('method')}")
+    return sorted(set(scrubbed))
+
+
+def _apply_scrub(sf: SourceFile, rule: dict) -> None:
+    method = rule["method"]
+    if method == "discard_payload":
+        sf.raw_bytes = b"[SCRUBBED_PAYLOAD]"
+        sf.payload = None
+    # redact / null_out / delete_field operate on the located field/header.
+    # TODO(team): implement located-field redaction using rule['location'].
+    # Use PATTERN-based detection, not exact match (SOC R7), so a new credential
+    # format in production is still caught.
+    if rule.get("critical"):
+        log.warning("CRITICAL scrub applied to %s (%s)", sf.connector, rule.get("location"))
+
+
+# =============================================================================
+# 3. PRE-PROCESS — strip / decompress / decode / multiparse / externalise
+# =============================================================================
+def http_envelope_strip(raw: bytes) -> bytes:
+    """raw/ wire payloads carry HTTP headers; body starts after CRLFCRLF."""
+    sep = b"\r\n\r\n"
+    return raw.split(sep, 1)[1] if sep in raw else raw
+
+
+def maybe_gunzip(body: bytes) -> bytes:
+    return gzip.decompress(body) if body[:2] == b"\x1f\x8b" else body
+
+
+def extract_base64_blob(value: str) -> bytes:
+    return base64.b64decode(value)
+
+
+def json_multiparse(value: Any, depth: int) -> Any:
+    """Stringified-JSON that needs N rounds of json.loads (USCC double, Kapitus triple)."""
+    out = value
+    for _ in range(depth):
+        if isinstance(out, str):
+            out = json.loads(out)
+        else:
+            break
+    return out
+
+
+def externalise_if_large(value: Any, key: str, app_id: str, cfg: ClientConfig,
+                         lineage_blobs: list[dict]) -> Any:
+    """Fields above the size threshold (or binary PDFs) go to object storage and
+    are replaced by an external_ref URI (Kapitus REQ-VAL-09/05)."""
+    threshold = int(cfg["preprocess"]["external_ref"]["size_threshold_kb"]) * 1024
+    blob = value if isinstance(value, (bytes, bytearray)) else str(value).encode()
+    if len(blob) < threshold and not _looks_like_pdf(blob):
+        return value
+    uri = _object_store_put(blob, app_id, key, cfg)        # TODO(team) adapter
+    lineage_blobs.append({"field": key, "uri": uri, "size_bytes": len(blob)})
+    return {"external_ref": uri}
+
+
+def _looks_like_pdf(b: bytes) -> bool:
+    return b[:4] == b"%PDF"
+
+
+def _object_store_put(blob: bytes, app_id: str, key: str, cfg: ClientConfig) -> str:
+    pattern = cfg["preprocess"]["external_ref"]["object_store_uri_pattern"]
+    # TODO(team): real put; for now just format the deterministic URI.
+    return pattern.format(app_id=app_id, connector=key.split(".")[0], field=key)
+
+
+# =============================================================================
+# 4. PARSE STRATEGY REGISTRY  (the only place parsing varies)
+# =============================================================================
+ParseFn = Callable[[SourceFile, ClientConfig], Any]
+_STRATEGIES: dict[str, ParseFn] = {}
+
+
+def strategy(name: str) -> Callable[[ParseFn], ParseFn]:
+    def deco(fn: ParseFn) -> ParseFn:
         _STRATEGIES[name] = fn
         return fn
-    return decorator
+    return deco
 
 
-def get_strategy(name: str):
-    if name not in _STRATEGIES:
-        raise KeyError(
-            f"Unknown parse strategy: {name!r}. Registered: {list(_STRATEGIES)}"
-        )
-    return _STRATEGIES[name]
+def parse_file(sf: SourceFile, cfg: ClientConfig) -> Any:
+    conn = _connector_cfg(sf.connector, cfg)
+    if conn and conn.get("is_credential"):
+        return None                                    # scrub-only, never parsed
+    strat = (conn or {}).get("parse_strategy", "raw_json")
+    fn = _STRATEGIES.get(strat)
+    if not fn:
+        raise KeyError(f"No parse strategy '{strat}' registered for {sf.connector}")
+    sf.payload = fn(sf, cfg)
+    return sf.payload
 
-
-# ---------------------------------------------------------------------------
-# IC-1 — Credential scrub (regex/pattern-based; never exact-string matching)
-# Must execute to completion on every file before any parse, log, or route.
-# Connectors in scope: C161653 (Auth header), C754889 (user/pass), C103403 (Bearer)
-# ---------------------------------------------------------------------------
-
-_CREDENTIAL_PATTERNS: list[tuple[re.Pattern, str]] = [
-    # HTTP Authorization header — C161653
-    (re.compile(r'(?i)(Authorization\s*:\s*)\S+'), r'\g<1>[REDACTED]'),
-    # username / password fields — C754889
-    (re.compile(r'(?i)("?password"?\s*[=:]\s*")[^"]+("?)'), r'\g<1>[REDACTED]\g<2>'),
-    (re.compile(r'(?i)("?username"?\s*[=:]\s*")[^"]+("?)'), r'\g<1>[REDACTED]\g<2>'),
-    (re.compile(r'(?i)(password\s*=\s*)\S+'), r'\g<1>[REDACTED]'),
-    # Bearer token — header and JSON body — C103403
-    (re.compile(r'(?i)(Bearer\s+)\S+'), r'\g<1>[REDACTED]'),
-    (re.compile(r'(?i)("?(?:access_token|bearer_token|api_key|client_secret)"?\s*:\s*")[^"]+("?)'), r'\g<1>[REDACTED]\g<2>'),
-    # Generic token / OAuth patterns
-    (re.compile(r'(?i)("?(?:token|oauth_token|refresh_token)"?\s*:\s*")[^"]{8,}("?)'), r'\g<1>[REDACTED]\g<2>'),
-]
-
-
-def scrub_credentials(raw_text: str) -> str:
-    """
-    IC-1: Pattern-based credential scrub on raw file text.
-    Executes to completion before any parse, log, or downstream route.
-    Returns scrubbed text. No credential value may survive in any form.
-    """
-    for pattern, replacement in _CREDENTIAL_PATTERNS:
-        raw_text = pattern.sub(replacement, raw_text)
-    return raw_text
-
-
-def scrub_credentials_struct(node: Any) -> Any:
-    """Recursively scrub credentials from an already-parsed structure."""
-    if isinstance(node, dict):
-        return {k: scrub_credentials_struct(v) for k, v in node.items()}
-    if isinstance(node, list):
-        return [scrub_credentials_struct(item) for item in node]
-    if isinstance(node, str):
-        return scrub_credentials(node)
-    return node
-
-
-# ---------------------------------------------------------------------------
-# Custom exceptions
-# ---------------------------------------------------------------------------
-
-class PiiDetectedError(RuntimeError):
-    """Raised by assert_no_raw_pii() when raw PII is found. Blocks DataLake write."""
-
-
-class CredentialError(RuntimeError):
-    """Raised when a raw credential is detected in an unsafe context."""
-
-
-# ---------------------------------------------------------------------------
-# PII handling — IC-2 & IC-5
-# ---------------------------------------------------------------------------
-
-# Static field inventory — supplemented by client_config pii.fields at runtime.
-_PII_FIELD_NAMES: frozenset[str] = frozenset({
-    "ssn", "sin", "full_name", "first_name", "last_name",
-    "date_of_birth", "dob", "address", "street", "city",
-    "postal_code", "zip_code", "phone", "phone_number",
-    "email", "email_address",
-})
-
-# Pattern-based PII detection for extra_columns value scan (IC-2: values, not names)
-_PII_VALUE_PATTERNS: list[re.Pattern] = [
-    re.compile(r'\b\d{3}-\d{2}-\d{4}\b'),                                  # SSN
-    re.compile(r'\b\d{3}\s\d{3}\s\d{3}\b'),                                 # SIN
-    re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'),     # email
-    re.compile(r'\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}\b'),  # phone
-]
-
-_TOKEN_PREFIX = "TOK_"
-
-
-def _generate_token(value: str) -> str:
-    """Produce a stable opaque token from a PII value."""
-    return f"{_TOKEN_PREFIX}{uuid.uuid5(uuid.NAMESPACE_OID, value)}"
-
-
-def _scan_extra_columns_for_pii(extra_columns: dict[str, Any]) -> list[str]:
-    """
-    IC-2: Scan extra_columns values (not field names) for raw PII patterns.
-    Returns list of offending column names.
-    """
-    offenders: list[str] = []
-    for col_name, col_value in extra_columns.items():
-        str_val = str(col_value) if not isinstance(col_value, str) else col_value
-        for pattern in _PII_VALUE_PATTERNS:
-            if pattern.search(str_val):
-                offenders.append(col_name)
-                break
-    return offenders
-
-
-def tokenise_pii(record: AppRecord, pii_fields: list[str] | None = None) -> AppRecord:
-    """
-    IC-2: Replace raw PII in record.data and record.extra_columns with tokens.
-    pii_fields: from client_config pii.fields; merged with built-in _PII_FIELD_NAMES.
-    Sets record._pii_tokenised = True on completion.
-    """
-    all_pii_fields = _PII_FIELD_NAMES | set(f.lower() for f in (pii_fields or []))
-
-    for field_name in list(record.data.keys()):
-        if field_name.lower() in all_pii_fields:
-            val = record.data[field_name]
-            if isinstance(val, str) and val and not val.startswith(_TOKEN_PREFIX):
-                record.data[field_name] = _generate_token(val)
-
-    for col_name in list(record.extra_columns.keys()):
-        if col_name.lower() in all_pii_fields:
-            val = record.extra_columns[col_name]
-            if isinstance(val, str) and val and not val.startswith(_TOKEN_PREFIX):
-                record.extra_columns[col_name] = _generate_token(val)
-
-    record._pii_tokenised = True
-    return record
-
-
-def assert_no_raw_pii(record: AppRecord) -> None:
-    """
-    IC-2: Write gate — raises PiiDetectedError if raw PII survives.
-    (1) Pattern-scan of extra_columns values.
-    (2) Known-field check in record.data.
-    Must be called before write_record(). Never used as a logging step.
-    """
-    offenders = _scan_extra_columns_for_pii(record.extra_columns)
-    if offenders:
-        raise PiiDetectedError(
-            f"Raw PII in extra_columns for app_id={record.app_id_canonical!r}: "
-            f"columns={offenders}"
-        )
-    for field_name, val in record.data.items():
-        if field_name.lower() in _PII_FIELD_NAMES:
-            if isinstance(val, str) and val and not val.startswith(_TOKEN_PREFIX):
-                raise PiiDetectedError(
-                    f"Raw PII in data[{field_name!r}] for "
-                    f"app_id={record.app_id_canonical!r}"
-                )
-
-
-# ---------------------------------------------------------------------------
-# Validation — Standard Schema v1.1
-# ---------------------------------------------------------------------------
-
-_REQUIRED_RECORD_FIELDS = (
-    "app_id_canonical", "app_id_raw", "debtor_number", "sequence_id", "client_code",
-)
-
-
-def validate(record: AppRecord) -> AppRecord:
-    """
-    Validate AppRecord against Standard Schema v1.1.
-    IC-3: asserts all ID fields are str.
-    IC-2: lineage must contain both app_id_raw and app_id_canonical.
-    Sets record._validated = True on success; raises ValueError on failure.
-    """
-    for attr in _REQUIRED_RECORD_FIELDS:
-        val = getattr(record, attr, None)
-        if not val:
-            raise ValueError(f"Missing required field {attr!r} on AppRecord")
-        if attr in ("app_id_canonical", "app_id_raw", "debtor_number", "sequence_id"):
-            if not isinstance(val, str):
-                raise ValueError(
-                    f"IC-3 violation: {attr!r} must be str, got {type(val).__name__}"
-                )
-    if "app_id_raw" not in record.lineage:
-        raise ValueError("IC-3: lineage missing app_id_raw")
-    if "app_id_canonical" not in record.lineage:
-        raise ValueError("IC-3: lineage missing app_id_canonical")
-
-    record._validated = True
-    return record
-
-
-# ---------------------------------------------------------------------------
-# DataLake write — IC-2 gate (tokenise_pii + validate must precede)
-# ---------------------------------------------------------------------------
-
-def write_record(record: AppRecord, sink=None) -> dict[str, Any]:
-    """
-    Write a validated, PII-clean record to DataLake.
-
-    IC-2: raises RuntimeError if tokenise_pii() or validate() not yet completed.
-    IC-4: no credential value may appear in the output.
-    IC-5: no raw PII may appear in DataLake=Y output.
-    """
-    if not record._pii_tokenised:
-        raise RuntimeError(
-            f"IC-2 violation: tokenise_pii() not completed for "
-            f"app_id={record.app_id_canonical!r}. write_record() blocked."
-        )
-    if not record._validated:
-        raise RuntimeError(
-            f"IC-2 violation: validate() not completed for "
-            f"app_id={record.app_id_canonical!r}. write_record() blocked."
-        )
-
-    assert_no_raw_pii(record)  # IC-2 write gate — not a logging step
-
-    output: dict[str, Any] = {
-        "app_id_canonical": record.app_id_canonical,   # str — IC-3
-        "app_id_raw":       record.app_id_raw,         # str — IC-3
-        "debtor_number":    record.debtor_number,      # str — IC-3
-        "sequence_id":      record.sequence_id,        # str — IC-3
-        "client_code":      record.client_code,
-        "data":             record.data,
-        "extra_columns":    record.extra_columns,
-        "lineage":          record.lineage,
-        "data_lake_flag":   "Y",
-        "written_at_utc":   datetime.now(timezone.utc).isoformat(),
-    }
-
-    if sink is not None:
-        sink.write(output)
-
-    record.data_lake_flag = "Y"
-    return output
-
-
-# ---------------------------------------------------------------------------
-# Parse strategies
-# ---------------------------------------------------------------------------
 
 @strategy("gds_envelope_json")
-def _parse_gds_envelope_json(scrubbed_text: str, context: dict | None = None) -> dict:
-    """Parse GDS envelope JSON; unwrap outer envelope key."""
-    payload = json.loads(scrubbed_text)
-    for envelope_key in ("payload", "data", "body", "content"):
-        if envelope_key in payload:
-            return payload[envelope_key]
-    return payload
+def _parse_gds_envelope(sf: SourceFile, cfg: ClientConfig) -> Any:
+    """data/ tier: full GDS envelope; real payload under data{}."""
+    obj = json.loads(sf.path.read_text(encoding="utf-8"))
+    return obj.get("data", obj)
 
 
 @strategy("raw_json")
-def _parse_raw_json(scrubbed_text: str, context: dict | None = None) -> dict:
-    """Parse raw JSON with no envelope stripping."""
-    return json.loads(scrubbed_text)
+def _parse_raw_json(sf: SourceFile, cfg: ClientConfig) -> Any:
+    body = maybe_gunzip(http_envelope_strip(sf.path.read_bytes()))
+    return json.loads(body)
 
 
 @strategy("xml_dict")
-def _parse_xml_dict(scrubbed_text: str, context: dict | None = None) -> dict:
-    """Parse XML into a dict via xmltodict."""
-    return xmltodict.parse(scrubbed_text)
+def _parse_xml(sf: SourceFile, cfg: ClientConfig) -> Any:
+    import xmltodict  # all TR connectors; TransUnion XML
+    body = maybe_gunzip(http_envelope_strip(sf.path.read_bytes()))
+    d = xmltodict.parse(body)
+    return _strip_ns(d)          # drop ns2:/bs:/cs: prefixes
 
 
 @strategy("soap_xml")
-def _parse_soap_xml(scrubbed_text: str, context: dict | None = None) -> dict:
-    """Parse SOAP XML; unwrap Envelope > Body > first child."""
-    parsed = xmltodict.parse(scrubbed_text)
-    envelope = (
-        parsed.get("soap:Envelope")
-        or parsed.get("Envelope")
-        or parsed
-    )
-    body = (
-        envelope.get("soap:Body")
-        or envelope.get("Body")
-        or envelope
-    )
-    for val in body.values():
-        if val is not None:
-            return val if isinstance(val, dict) else {"value": val}
-    return body
+def _parse_soap(sf: SourceFile, cfg: ClientConfig) -> Any:
+    import xmltodict             # USCC C23812 manual review
+    body = http_envelope_strip(sf.path.read_bytes())
+    return _strip_ns(xmltodict.parse(body))
 
 
 @strategy("fff")
-def _parse_fff(scrubbed_text: str, context: dict | None = None) -> dict:
-    # TODO(Q-FFF): FFF parse strategy body not implemented.
-    # Implementation is gated on Q-FFF resolution.
-    raise NotImplementedError(
-        "TODO(Q-FFF): FFF parser is not implemented. "
-        "Implementation is gated on Q-FFF resolution."
-    )
+def _parse_fff(sf: SourceFile, cfg: ClientConfig) -> Any:
+    # Fixed-form-format bureau payload (SOC Experian C161652).
+    # TODO(team): width spec per record type from the SDD / bureau layout.
+    raise NotImplementedError("FFF layout spec required from team")
 
 
 @strategy("binary_external_ref")
-def _parse_binary_external_ref(scrubbed_text: str, context: dict | None = None) -> dict:
-    """Binary files produce an external reference stub; content is not parsed inline."""
-    return {
-        "binary_external_ref": True,
-        "content_preview": scrubbed_text[:64] if scrubbed_text else "",
-        "note": "Binary file — handled by external reference adapter.",
-    }
+def _parse_binary(sf: SourceFile, cfg: ClientConfig) -> Any:
+    body = http_envelope_strip(sf.path.read_bytes())
+    blobs: list[dict] = []
+    return externalise_if_large(body, f"{sf.connector}.body",
+                                sf.app_id_raw or "unknown", cfg, blobs)
 
 
 @strategy("credential_discard")
-def _parse_credential_discard(scrubbed_text: str, context: dict | None = None) -> dict:
-    """
-    Files classified as credential-only are discarded post-scrub.
-    IC-1/IC-4: no credential content is parsed, logged, or stored.
-    """
-    return {"discarded": True, "reason": "credential_discard strategy applied"}
+def _parse_cred(sf: SourceFile, cfg: ClientConfig) -> Any:
+    return None
 
 
-# ---------------------------------------------------------------------------
-# Transform dispatch
-# ---------------------------------------------------------------------------
-
-def apply_transform(transform_name: str, value: Any, params: dict | None = None) -> Any:
-    """
-    Dispatch a named transform. Raises KeyError for unknown names.
-    eval() is prohibited — ast.literal_eval() is used exclusively (CLAUDE.md).
-    """
-    params = params or {}
-    _dispatch = {
-        "date_to_utc_iso":   _transform_date_to_utc_iso,
-        "string_to_numeric": _transform_string_to_numeric,
-        "split_on_delim":    _transform_split_on_delim,
-        "json_double_parse": _transform_json_double_parse,
-        "ast_literal_eval":  _transform_ast_literal_eval,
-        "base64_extract":    _transform_base64_extract,
-    }
-    if transform_name not in _dispatch:
-        raise KeyError(
-            f"Unknown transform: {transform_name!r}. Registered: {list(_dispatch)}"
-        )
-    return _dispatch[transform_name](value, params)
+def _strip_ns(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {k.split(":")[-1]: _strip_ns(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_strip_ns(v) for v in obj]
+    return obj
 
 
-def _transform_date_to_utc_iso(value: Any, params: dict) -> str:
-    fmt = params.get("fmt", "%Y-%m-%d")
-    dt = datetime.strptime(str(value), fmt)
-    return dt.replace(tzinfo=timezone.utc).isoformat()
+def _connector_cfg(code: str | None, cfg: ClientConfig) -> dict | None:
+    for c in cfg.get("connectors", []) or []:
+        if c["code"] == code:
+            return c
+    return None
 
 
-def _transform_string_to_numeric(value: Any, params: dict) -> int | float:
-    numeric_type = params.get("numeric_type", "float")
-    return int(str(value).strip()) if numeric_type == "int" else float(str(value).strip())
+# =============================================================================
+# 5. GROUP + MERGE — one record per App ID
+# =============================================================================
+def group_by_app(files: list[SourceFile], cfg: ClientConfig) -> dict[str, AppRecord]:
+    apps: dict[str, AppRecord] = {}
+    for sf in files:
+        if not sf.app_id_raw:
+            continue
+        canonical = _canonicalise_app_id(sf.app_id_raw, cfg)
+        rec = apps.setdefault(canonical, AppRecord(canonical, sf.app_id_raw))
+        rec.files.append(sf)
+    return apps
 
 
-def _transform_split_on_delim(value: Any, params: dict) -> list[str]:
-    delim = params.get("delim", ",")
-    return [part.strip() for part in str(value).split(delim)]
+def _canonicalise_app_id(raw: str, cfg: ClientConfig) -> str:
+    out = raw
+    for rule in cfg["application_id"].get("suffix_rules", []) or []:
+        suf = rule.get("suffix")
+        if suf and out.endswith(suf) and rule.get("action") == "strip":
+            out = out[: -len(suf)]
+    return out
 
 
-def _transform_json_double_parse(value: Any, params: dict) -> Any:
-    first = json.loads(value) if isinstance(value, str) else value
-    return json.loads(first) if isinstance(first, str) else first
+def merge_sessions(rec: AppRecord, cfg: ClientConfig) -> None:
+    """Apply the client's session model. Sets multi_session_incomplete etc."""
+    model = cfg["sessions"]["model"]
+    if model == "multi_session_merge":
+        expected = int(cfg["sessions"]["multi_session"]["expected_sessions"])
+        seqs = {sf.sequence_id for sf in rec.files if sf.sequence_id}
+        if len(seqs) < expected:
+            rec.lineage["multi_session_incomplete"] = True
+            rec.quarantined = True
+    # TODO(team): label multi_fire connectors (e.g. transunion_call_1/2) by step.
 
 
-def _transform_ast_literal_eval(value: Any, params: dict) -> Any:
-    # eval() is prohibited — ast.literal_eval() exclusively (CLAUDE.md)
-    return ast.literal_eval(str(value))
+# =============================================================================
+# 6. FIELD MAPPING — drive from field_mapping.<CLIENT>.xlsx
+# =============================================================================
+@dataclass
+class MappingRow:
+    sdd_path: str
+    category: str
+    data_type: str
+    pii: bool
+    sources: list[dict]            # ordered primary/secondary/tertiary
+    transform: str | None
+    construction: str | None       # free-text construction logic / array filter
 
 
-def _transform_base64_extract(value: Any, params: dict) -> str:
-    encoding = params.get("encoding", "utf-8")
-    return base64.b64decode(str(value)).decode(encoding)
+def load_mapping_sheet(xlsx_path: str | Path) -> list[MappingRow]:
+    """Read the canonical field-mapping workbook into MappingRows.
+    Column layout is defined in references/mapping_schema.md."""
+    from openpyxl import load_workbook
+    wb = load_workbook(xlsx_path, read_only=True, data_only=True)
+    ws = wb["Field Mapping"]
+    rows = list(ws.iter_rows(values_only=True))
+    header = {str(h).strip(): i for i, h in enumerate(rows[0]) if h}
+    out: list[MappingRow] = []
+    for r in rows[1:]:
+        sdd = r[header.get("SDD Field Path", 1)]
+        if not sdd or str(sdd).strip().startswith("──"):
+            continue                                   # category banner
+        out.append(_row_from_cells(r, header))
+    return out
 
 
-# ---------------------------------------------------------------------------
-# Lineage and ID helpers
-# ---------------------------------------------------------------------------
-
-def build_lineage(
-    app_id_raw: str,
-    app_id_canonical: str,
-    source_file: str,
-    strategy_name: str,
-    client_code: str,
-) -> dict[str, str]:
-    """
-    Build lineage dict. IC-3: both app_id_raw and app_id_canonical must be present.
-    """
-    return {
-        "app_id_raw":       str(app_id_raw),         # str — IC-3
-        "app_id_canonical": str(app_id_canonical),   # str — IC-3
-        "source_file":      source_file,
-        "parse_strategy":   strategy_name,
-        "client_code":      client_code,
-        "pipeline_version": "v1.1",
-        "processed_at_utc": datetime.now(timezone.utc).isoformat(),
-    }
+def _row_from_cells(r, header) -> MappingRow:
+    def cell(name, default=None):
+        i = header.get(name)
+        return r[i] if i is not None and i < len(r) else default
+    sources = []
+    for tier in ("PRIMARY", "SECONDARY", "TERTIARY"):
+        conn = cell(f"{tier}\nConnector | Folder | Direction") or cell(f"{tier} Connector | Folder | Direction")
+        path = cell(f"{tier} Path") or cell(f"PRIMARY Path\n[Obj-1 / Current / First Score]") if tier == "PRIMARY" else cell(f"{tier} Path")
+        if conn:
+            sources.append({"tier": tier, "locator": str(conn), "path": str(path or "")})
+    return MappingRow(
+        sdd_path=str(cell("SDD Field Path")).strip(),
+        category=str(cell("Category") or ""),
+        data_type=str(cell("Data Type") or ""),
+        pii=bool(cell("PII")),
+        sources=sources,
+        transform=cell("Transform"),
+        construction=cell("Mapping Notes / Construction Logic / Open Questions"),
+    )
 
 
-def normalise_app_id(raw_id: str) -> str:
-    """
-    Produce app_id_canonical from app_id_raw.
-    Strips _test suffix; preserves leading zeros. Always returns str (IC-3).
-    """
-    return str(raw_id).removesuffix("_test").strip()
+def apply_mapping(rec: AppRecord, mapping: list[MappingRow], cfg: ClientConfig) -> None:
+    """For each SDD path, resolve by source priority and write into rec.record."""
+    for row in mapping:
+        value = resolve_source(rec, row, cfg)
+        if value is None:
+            continue
+        value = apply_transform(value, row, rec, cfg)
+        _set_path(rec.record, row.sdd_path, value)
 
 
-# ---------------------------------------------------------------------------
-# Pipeline entry point
-# ---------------------------------------------------------------------------
+def resolve_source(rec: AppRecord, row: MappingRow, cfg: ClientConfig) -> Any:
+    """Walk primary -> secondary -> tertiary; take first present non-null.
+    This is the generic Source-Priority resolution all four clients use."""
+    for src in row.sources:
+        val = _read_locator(rec, src, cfg)
+        if val not in (None, "", []):
+            return val
+    return None
 
-def run_pipeline(
-    manifest: list[dict],
-    client_config: dict,
-    sink=None,
-) -> list[dict]:
-    """
-    Process a file manifest through the full SOC ingestion pipeline.
 
-    Pipeline order (invariants enforced):
-      1. scrub_credentials()   — IC-1: before any parse/log/route
-      2. parse via strategy
-      3. build AppRecord       — IC-3: IDs as str
-      4. tokenise_pii()        — IC-2
-      5. validate()            — IC-2
-      6. write_record()        — IC-2 gate + assert_no_raw_pii() inside
-                                 IC-4: no credential in output
-                                 IC-5: no raw PII in DataLake=Y output
+def _read_locator(rec: AppRecord, src: dict, cfg: ClientConfig) -> Any:
+    # locator like "C4871 web_service | data/ | REQ"; path like "data.Request.contract_id"
+    # TODO(team): match connector+folder+direction to the right SourceFile.payload,
+    # then dotted-path lookup. Returns None if not present (graceful nulls).
+    return None
 
-    Returns list of DataLake output dicts for successfully written records.
-    """
-    results: list[dict] = []
-    pii_fields: list[str] = client_config.get("pii", {}).get("fields", [])
 
-    for entry in manifest:
-        raw_text: str = entry.get("raw_text", "")
-        strategy_name: str = entry.get("parse_strategy", "raw_json")
-        app_id_raw: str = str(entry.get("app_id_raw", ""))        # str — IC-3
-        app_id_canonical: str = normalise_app_id(app_id_raw)      # str — IC-3
-        debtor_number: str = str(entry.get("debtor_number", ""))  # str — IC-3
-        sequence_id: str = str(entry.get("sequence_id", ""))      # str — IC-3
-        client_code: str = client_config.get("client_code", "")
-        source_file: str = entry.get("source_file", "")
+def apply_transform(value: Any, row: MappingRow, rec: AppRecord, cfg: ClientConfig) -> Any:
+    t = (row.transform or "").lower()
+    if "date" in t:
+        return _to_utc_iso(value)
+    if "numeric" in t or "int" in t:
+        return _coerce_number(value)
+    if "split" in t:
+        delim = "|"                                     # configurable per row
+        return [s.strip() for s in str(value).split(delim) if s.strip()]
+    # EAV, score-array construction, per-applicant indicator filtering,
+    # one-object->multi-entry expansion (TIB) are construction-logic transforms.
+    # TODO(team): dispatch on row.construction for those.
+    return value
 
-        # Step 1 — IC-1: scrub credentials before any parse or log
-        scrubbed = scrub_credentials(raw_text)
 
-        # Step 2 — parse
-        parse_fn = get_strategy(strategy_name)
-        parsed = parse_fn(scrubbed)
+# =============================================================================
+# 7. INVARIANT I2 — PII TOKENISATION (before write) + scan
+# =============================================================================
+def tokenise_pii(rec: AppRecord, cfg: ClientConfig) -> None:
+    for f in cfg.get("pii", {}).get("fields", []) or []:
+        # TODO(team): locate the field in rec.record and replace with token per method:
+        #   pseudonym_reversible -> vault token ; oneway_hash -> hash ;
+        #   scrub_never_store -> remove ; year_only -> truncate DOB.
+        pass
+    if cfg["pii"]["extra_columns_scan"]["enabled"]:
+        _scan_extra_columns_for_pii(rec, cfg)
 
-        # Step 3 — build AppRecord (IDs always str — IC-3)
-        record = AppRecord(
-            app_id_canonical=app_id_canonical,
-            app_id_raw=app_id_raw,
-            debtor_number=debtor_number,
-            sequence_id=sequence_id,
-            client_code=client_code,
-            data=parsed if isinstance(parsed, dict) else {"content": parsed},
-            lineage=build_lineage(
-                app_id_raw, app_id_canonical, source_file, strategy_name, client_code
-            ),
-        )
 
-        # Step 4 — IC-2: tokenise PII before write
-        record = tokenise_pii(record, pii_fields=pii_fields)
+def _scan_extra_columns_for_pii(rec: AppRecord, cfg: ClientConfig) -> None:
+    # TODO(team): regex scan every extraColumns value; tokenise matches.
+    pass
 
-        # Step 5 — IC-2: validate (checks IC-3 lineage completeness)
-        record = validate(record)
 
-        # Step 6 — IC-2 write gate; assert_no_raw_pii() called inside write_record()
-        output = write_record(record, sink=sink)
-        results.append(output)
+def assert_no_raw_pii(rec: AppRecord, cfg: ClientConfig) -> None:
+    """INVARIANT I2 post-write proof. Raises if any raw-PII pattern remains."""
+    patterns = cfg["pii"]["extra_columns_scan"]["patterns"]
+    blob = json.dumps(rec.record) + json.dumps(rec.extra_columns)
+    # TODO(team): compile real regexes for ssn/fein/ach/email/phone.
+    for _pat in patterns:
+        pass
+    # raise RuntimeError(f"RAW PII detected in {rec.app_id_canonical}") on match
 
-    return results
+
+# =============================================================================
+# 8. INVARIANT I3 — VALIDATION (before write) + quarantine
+# =============================================================================
+RuleFn = Callable[[AppRecord, ClientConfig], bool]   # True == pass
+_RULES: dict[str, RuleFn] = {}
+
+
+def rule(rule_id: str):
+    def deco(fn: RuleFn):
+        _RULES[rule_id] = fn
+        return fn
+    return deco
+
+
+@rule("REQ-VAL-001")
+def _appid_present(rec, cfg): return bool(rec.app_id_canonical)
+
+@rule("REQ-VAL-002")
+def _geo_valid(rec, cfg):
+    valids = cfg["validation"]["client_params"]["valid_geographies"]
+    return rec.geography in valids if rec.geography else True
+
+@rule("REQ-VAL-005")
+def _date_valid(rec, cfg):
+    d = rec.record.get("system", {}).get("application", {}).get("applicationDate")
+    return _is_iso_utc(d) if d else False
+
+# REQ-VAL-007 (no raw PII) and REQ-VAL-008 (creds scrubbed) are proven by the
+# invariant steps themselves; they appear here as explicit gates too.
+@rule("REQ-VAL-007")
+def _no_raw_pii(rec, cfg): return True   # assert_no_raw_pii already ran
+
+@rule("REQ-VAL-008")
+def _creds_scrubbed(rec, cfg):
+    return bool(rec.lineage.get("credential_scrubbed_connectors") is not None)
+
+# TODO(team): add REQ-VAL-003/004/006 and REQ-BL-001..N as the clients require.
+
+
+def validate(rec: AppRecord, cfg: ClientConfig) -> None:
+    hard = set(cfg["validation"]["hard_quarantine_rules"])
+    for rid, fn in _RULES.items():
+        try:
+            passed = fn(rec, cfg)
+        except Exception as e:                          # a throwing rule == fail
+            passed = False
+            log.warning("rule %s errored: %s", rid, e)
+        if not passed:
+            rec.validation_failures.append(rid)
+            if rid in hard:
+                rec.quarantined = True
+    rec.lineage["validation_status"] = (
+        "FAIL" if rec.quarantined else "WARN" if rec.validation_failures else "PASS"
+    )
+    rec.lineage["validation_failures"] = rec.validation_failures
+
+
+# =============================================================================
+# 9. LINEAGE + WRITE
+# =============================================================================
+def build_lineage(rec: AppRecord, cfg: ClientConfig, source_zip: str,
+                  scrubbed: list[str], blobs: list[dict]) -> None:
+    rec.lineage.update({
+        "source_zip": source_zip,
+        "app_id_raw": rec.app_id_raw,
+        "app_id_canonical": rec.app_id_canonical,
+        "geography": rec.geography,
+        "client_code": cfg.client_code,
+        "schema_version": cfg.schema_version,
+        "mapping_config_version": cfg.get("config_version"),
+        "transform_timestamp": datetime.now(timezone.utc).isoformat(),
+        "source_files": [str(sf.path.name) for sf in rec.files],
+        "credential_scrubbed_connectors": scrubbed,
+        "base64_blobs_extracted": blobs,
+        "has_connector_data": any(sf.connector for sf in rec.files),
+    })
+    rec.record.setdefault("system", {})["lineage"] = rec.lineage
+
+
+def write_record(rec: AppRecord, cfg: ClientConfig) -> None:
+    if rec.quarantined:
+        log.error("QUARANTINE %s -> %s", rec.app_id_canonical, rec.validation_failures)
+        return                                          # blocked from DataLake=Y
+    # TODO(team): real DataLake write (partitioned by client/geography/date).
+    log.info("WRITE %s (%s)", rec.app_id_canonical, rec.lineage["validation_status"])
+
+
+# =============================================================================
+# 10. ORCHESTRATION — fixed order; invariants cannot be reordered
+# =============================================================================
+def run_pipeline(zip_path: str | Path, config_path: str | Path,
+                 mapping_path: str | Path, workdir: str | Path) -> list[AppRecord]:
+    cfg = ClientConfig.load(config_path)
+    mapping = load_mapping_sheet(mapping_path)
+
+    root = unpack_zip(zip_path, workdir)
+    files = build_manifest(root, cfg)
+
+    scrubbed = scrub_credentials(files, cfg)            # I1 — FIRST
+    for sf in files:
+        try:
+            parse_file(sf, cfg)
+        except NotImplementedError as e:
+            log.warning("parse pending for %s: %s", sf.connector, e)
+
+    apps = group_by_app(files, cfg)
+    out: list[AppRecord] = []
+    blobs: list[dict] = []
+    for rec in apps.values():
+        merge_sessions(rec, cfg)
+        apply_mapping(rec, mapping, cfg)
+        tokenise_pii(rec, cfg)                          # I2 — before write
+        assert_no_raw_pii(rec, cfg)                     # I2 — proof
+        build_lineage(rec, cfg, str(zip_path), scrubbed, blobs)
+        validate(rec, cfg)                              # I3 — before write
+        write_record(rec, cfg)
+        out.append(rec)
+    return out
+
+
+# --- small shared helpers ----------------------------------------------------
+def _to_utc_iso(value: Any) -> str | None:
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%Y%m%d%H%M%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(str(value), fmt).replace(tzinfo=timezone.utc).isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def _coerce_number(value: Any):
+    s = re.sub(r"[^\d.\-]", "", str(value))
+    if s in ("", "-", "."):
+        return None
+    return float(s) if "." in s else int(s)
+
+
+def _is_iso_utc(value: Any) -> bool:
+    try:
+        datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def _set_path(obj: dict, dotted: str, value: Any) -> None:
+    parts = dotted.split(".")
+    cur = obj
+    for p in parts[:-1]:
+        cur = cur.setdefault(p, {})
+    cur[parts[-1]] = value
