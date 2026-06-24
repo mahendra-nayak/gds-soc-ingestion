@@ -642,33 +642,76 @@ def write_record(rec: AppRecord, cfg: ClientConfig) -> None:
 # =============================================================================
 # 10. ORCHESTRATION — fixed order; invariants cannot be reordered
 # =============================================================================
-def run_pipeline(zip_path: str | Path, config_path: str | Path,
-                 mapping_path: str | Path, workdir: str | Path) -> list[AppRecord]:
-    cfg = ClientConfig.load(config_path)
-    mapping = load_mapping_sheet(mapping_path)
+def _handle_fff_quarantine(sf: SourceFile, cfg: ClientConfig) -> None:
+    # TODO(Q-FFF): FFF parse failure quarantine handling pending Q-FFF resolution.
+    log.warning(
+        "FFF quarantine pending Q-FFF: file=%s connector=%s", sf.path.name, sf.connector
+    )
+
+
+def run_pipeline(
+    zip_path: str | Path,
+    config_path: str | Path,
+    mapping_path: str | Path,
+    workdir: str | Path,
+) -> list[AppRecord]:
+    """
+    Process a GDS ZIP package through the full SOC ingestion pipeline.
+
+    Fixed call order — invariants cannot be reordered:
+      1. build_manifest()
+      2. dispatch_by_geo()            — INV-10: before any scrub or parse
+      3. Per-geography loop:
+         a. scrub_credentials()      — I1: first operation inside per-geo loop
+         b. parse_file()
+         c. group_by_app()
+         d. per-record: merge_sessions → apply_mapping → tokenise_pii (I2)
+            → assert_no_raw_pii (I2) → build_lineage → validate (I3) → write_record
+    """
+    cfg_base = ClientConfig.load(config_path)   # base config for manifest build
 
     root = unpack_zip(zip_path, workdir)
-    files = build_manifest(root, cfg)
+    # GDS packages often have a single top-level subfolder; descend into it
+    subdirs = [p for p in root.iterdir() if p.is_dir()]
+    if len(subdirs) == 1:
+        root = subdirs[0]
+    files = build_manifest(root, cfg_base)
 
-    scrubbed = scrub_credentials(files, cfg)            # I1 — FIRST
-    for sf in files:
-        try:
-            parse_file(sf, cfg)
-        except NotImplementedError as e:
-            log.warning("parse pending for %s: %s", sf.connector, e)
+    geo_files = dispatch_by_geo(files)          # INV-10: dispatch BEFORE scrub
 
-    apps = group_by_app(files, cfg)
     out: list[AppRecord] = []
-    blobs: list[dict] = []
-    for rec in apps.values():
-        merge_sessions(rec, cfg)
-        apply_mapping(rec, mapping, cfg)
-        tokenise_pii(rec, cfg)                          # I2 — before write
-        assert_no_raw_pii(rec, cfg)                     # I2 — proof
-        build_lineage(rec, cfg, str(zip_path), scrubbed, blobs)
-        validate(rec, cfg)                              # I3 — before write
-        write_record(rec, cfg)
-        out.append(rec)
+    for geo, geo_file_set in geo_files.items():
+        if not geo_file_set:
+            continue
+
+        geo_cfg = ClientConfig.load(f"assets/client_config.SOC_{geo}.yaml")
+        try:
+            geo_mapping = load_mapping_sheet(f"assets/field_mapping.SOC_{geo}.xlsx")
+        except Exception as e:
+            log.warning("field mapping unavailable for %s: %s — mapping skipped", geo, e)
+            geo_mapping = []
+
+        scrubbed = scrub_credentials(geo_file_set, geo_cfg)    # I1 — FIRST in loop
+        for sf in geo_file_set:
+            try:
+                parse_file(sf, geo_cfg)
+            except NotImplementedError as e:
+                log.warning("parse pending %s: %s", sf.connector, e)
+                _handle_fff_quarantine(sf, geo_cfg)            # TODO(Q-FFF)
+
+        apps = group_by_app(geo_file_set, geo_cfg)
+        blobs: list[dict] = []
+        for rec in apps.values():
+            rec.geography = geo
+            merge_sessions(rec, geo_cfg)
+            apply_mapping(rec, geo_mapping, geo_cfg)
+            tokenise_pii(rec, geo_cfg)                          # I2 — before write
+            assert_no_raw_pii(rec, geo_cfg)                     # I2 — proof
+            build_lineage(rec, geo_cfg, str(zip_path), scrubbed, blobs)
+            validate(rec, geo_cfg)                              # I3 — before write
+            write_record(rec, geo_cfg)
+            out.append(rec)
+
     return out
 
 
