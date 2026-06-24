@@ -78,6 +78,7 @@ class SourceFile:
     payload: Any = None            # populated after parse
     raw_bytes: bytes | None = None
     geography: str | None = None   # USA | CAN | None (unclassified / unrecognised)
+    datetime: "datetime | None" = None  # file-level timestamp (set from filename or payload)
 
 
 @dataclass
@@ -512,35 +513,200 @@ def dispatch_by_geo(files: list[SourceFile]) -> dict[str, list[SourceFile]]:
 
 
 def group_by_app(files: list[SourceFile], cfg: ClientConfig) -> dict[str, AppRecord]:
+    """Group SourceFiles into AppRecords by canonical App ID.
+
+    Single purpose: partition + dedup + quarantine-flag per-group.
+    INV-07 / D-10: canonical and raw IDs stored as VARCHAR strings throughout.
+    INV-09: records with _test suffix quarantined (not written to DataLake=Y).
+    D-02: cross-debtor mismatch within a group quarantined.
+    """
     apps: dict[str, AppRecord] = {}
     for sf in files:
         if not sf.app_id_raw:
             continue
-        canonical = _canonicalise_app_id(sf.app_id_raw, cfg)
-        rec = apps.setdefault(canonical, AppRecord(canonical, sf.app_id_raw))
+        canonical, had_test = _canonicalise_app_id(sf.app_id_raw, cfg)
+        if canonical not in apps:
+            rec = AppRecord(canonical, sf.app_id_raw)
+            rec.lineage["app_id_raw"] = sf.app_id_raw         # IC-3: preserved
+            rec.lineage["app_id_canonical"] = canonical        # IC-3: preserved
+            apps[canonical] = rec
+        rec = apps[canonical]
+        if had_test:
+            rec.lineage["app_id_raw_had_test_suffix"] = True
         rec.files.append(sf)
+
+    for rec in apps.values():
+        # Dedup retry files before any further checks
+        rec.files = _dedup_retry_files(rec.files)
+
+        # INV-09: quarantine _test records — never write to DataLake=Y
+        if rec.lineage.get("app_id_raw_had_test_suffix"):
+            rec.quarantined = True
+            rec.lineage["test_quarantine"] = True
+            # TODO(Q3): when separate_partition confirmed, route here instead of quarantine
+
+        # D-02: all files in a group must share the same debtor number
+        _check_group_debtor_consistency(rec)
+
     return apps
 
 
-def _canonicalise_app_id(raw: str, cfg: ClientConfig) -> str:
+def _canonicalise_app_id(raw: str, cfg: ClientConfig) -> tuple[str, bool]:
+    """Return (canonical_id, had_test_suffix).
+
+    Applies suffix_rules from config. INV-07 / D-10: returns VARCHAR string,
+    no numeric coercion at any point.
+    """
     out = raw
+    had_test = False
     for rule in cfg["application_id"].get("suffix_rules", []) or []:
         suf = rule.get("suffix")
         if suf and out.endswith(suf) and rule.get("action") == "strip":
             out = out[: -len(suf)]
-    return out
+            if suf == "_test":
+                had_test = True
+    return out, had_test
+
+
+def _dedup_retry_files(files: list[SourceFile]) -> list[SourceFile]:
+    """Remove duplicate retry files, keeping the latest by filename sort.
+
+    Two files are duplicates when they share (connector, direction, sequence_id).
+    Sorted ascending by path name so the last entry (latest filename timestamp)
+    overwrites earlier ones.  INV-07: sequence_id compared as string — no cast.
+    """
+    seen: dict[tuple, SourceFile] = {}
+    for sf in sorted(files, key=lambda f: f.path.name):
+        key = (sf.connector, sf.direction, sf.sequence_id)
+        seen[key] = sf
+    return list(seen.values())
+
+
+def _check_group_debtor_consistency(rec: AppRecord) -> None:
+    """D-02 (group-level): all files in a group must share one debtor number.
+
+    Debtor number is the leading component of app_id_raw before the first '_'.
+    INV-07: compared as strings only.
+    """
+    debtors = {
+        sf.app_id_raw.split("_")[0]
+        for sf in rec.files
+        if sf.app_id_raw
+    }
+    if len(debtors) > 1:
+        rec.quarantined = True
+        rec.validation_failures.append("D-02-cross-session-identity-mismatch")
 
 
 def merge_sessions(rec: AppRecord, cfg: ClientConfig) -> None:
-    """Apply the client's session model. Sets multi_session_incomplete etc."""
-    model = cfg["sessions"]["model"]
-    if model == "multi_session_merge":
-        expected = int(cfg["sessions"]["multi_session"]["expected_sessions"])
-        seqs = {sf.sequence_id for sf in rec.files if sf.sequence_id}
-        if len(seqs) < expected:
-            rec.lineage["multi_session_incomplete"] = True
-            rec.quarantined = True
-    # TODO(team): label multi_fire connectors (e.g. transunion_call_1/2) by step.
+    """Apply the client's session model.
+
+    CAN records: detect bureau sessions by connector presence (TASK-3.3),
+    check session ordering (TASK-3.4), and check EcsDebtorNumber payload
+    consistency (TASK-3.5).
+    USA records: no multi-session merge logic in this release.
+    """
+    if rec.geography == "CAN":
+        _detect_can_sessions(rec)
+        _check_can_session_order(rec)
+        _check_payload_debtor_consistency(rec)
+
+
+# CAN session connector identifiers
+_CAN_SESSION1_CONNECTORS: frozenset[str] = frozenset({"C100810"})
+_CAN_SESSION2_CONNECTORS: frozenset[str] = frozenset({"C161653", "C161796"})
+
+
+def _detect_can_sessions(rec: AppRecord) -> None:
+    """Detect CAN bureau evaluation sessions by connector presence only.
+
+    IMPLEMENTATION GUIDANCE (from removed INV-11):
+      Uses connector identity — NOT sequence_id — for session detection.
+      sequence_id is unreliable for CAN session identity (USA retry at
+      seq=80 has two data sessions that represent retry, not two bureau
+      sessions). sequence_id is never read in this function.
+
+    D-05: if bureau_eval_indicated and one session is absent → quarantine.
+    """
+    connectors = {sf.connector for sf in rec.files}
+
+    session1_present = bool(connectors & _CAN_SESSION1_CONNECTORS)
+    session2_present = bool(connectors & _CAN_SESSION2_CONNECTORS)
+    bureau_eval_indicated = session1_present or session2_present
+
+    rec.lineage["can_session_1_connectors"] = (
+        sorted(_CAN_SESSION1_CONNECTORS & connectors) if session1_present else []
+    )
+    rec.lineage["can_session_2_connectors"] = (
+        sorted(_CAN_SESSION2_CONNECTORS & connectors) if session2_present else []
+    )
+
+    if bureau_eval_indicated and not (session1_present and session2_present):
+        rec.lineage["multi_session_incomplete"] = True
+        rec.quarantined = True
+        rec.validation_failures.append("REQ-VAL-003")
+
+
+def _check_can_session_order(rec: AppRecord) -> None:
+    """D-01: EFX session timestamp must be strictly > TU session timestamp.
+
+    Soft-warn only: records the anomaly but does NOT quarantine or block write.
+    Skipped when either session has no files with a datetime set.
+    """
+    tu_files  = [sf for sf in rec.files if sf.connector in _CAN_SESSION1_CONNECTORS
+                 and sf.datetime is not None]
+    efx_files = [sf for sf in rec.files if sf.connector in _CAN_SESSION2_CONNECTORS
+                 and sf.datetime is not None]
+
+    if not tu_files or not efx_files:
+        return
+
+    tu_ts  = max(sf.datetime for sf in tu_files)
+    efx_ts = max(sf.datetime for sf in efx_files)
+
+    if efx_ts <= tu_ts:
+        rec.lineage["session_order_anomaly"] = True
+        rec.validation_failures.append("REQ-BL-002")
+
+
+def _check_payload_debtor_consistency(rec: AppRecord) -> None:
+    """D-02 (payload-level): EcsDebtorNumber must be identical across all sessions.
+
+    Extracts EcsDebtorNumber from parsed payloads per connector/folder convention.
+    Quarantines when COUNT(DISTINCT EcsDebtorNumber) > 1.
+    Gracefully skipped when no payload is parsed yet (sf.payload is None).
+    """
+    debtors = {
+        v for sf in rec.files
+        if (v := _extract_ecs_debtor(sf)) is not None
+    }
+    if len(debtors) > 1:
+        rec.quarantined = True
+        rec.validation_failures.append("D-02-payload-debtor-mismatch")
+        log.error(
+            "EcsDebtorNumber mismatch AppID=%s values=%s",
+            rec.app_id_canonical, debtors,
+        )
+
+
+def _extract_ecs_debtor(sf: SourceFile) -> str | None:
+    """Extract EcsDebtorNumber from a parsed SourceFile payload.
+
+    Convention per SOC connector SDD:
+      C225334-REQ  → payload['record']['EcsDebtorNumber']
+      C103403-RESP → payload['attributes']['EcsDebtorNumber']
+      data/ folder → payload['data']['EcsDebtorNumber']
+    Returns None if payload is absent or field not found.
+    """
+    if sf.payload is None:
+        return None
+    if sf.connector == "C225334" and sf.direction == "REQ":
+        return sf.payload.get("record", {}).get("EcsDebtorNumber")
+    if sf.connector == "C103403" and sf.direction == "RESP":
+        return sf.payload.get("attributes", {}).get("EcsDebtorNumber")
+    if sf.folder == "data":
+        return sf.payload.get("data", {}).get("EcsDebtorNumber")
+    return None
 
 
 # =============================================================================
