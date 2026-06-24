@@ -1,0 +1,254 @@
+# =============================================================================
+# DG-Forge — Per-Client Ingestion Config  (TEMPLATE — fill one per client)
+# -----------------------------------------------------------------------------
+# This file is the ONLY thing that should change between clients. The ingestion
+# engine (scripts/ingest_lib.py) is generic and reads everything it needs from
+# here plus the field-mapping sheet (field_mapping.<CLIENT>.xlsx).
+#
+# HOW TO USE
+#   1. Copy this file to  client_config.<CLIENT_CODE>.yaml   (e.g. client_config.SOC.yaml)
+#   2. Fill every <FILL: ...> placeholder. Leave a field absent only if it
+#      genuinely does not apply to the client, and say so in `notes`.
+#   3. Version the file in Git. The engine writes its version into
+#      lineage.mapping_config_version on every output record.
+#
+# RULE (DG-Forge): blank fields are the engineer's cognitive work. Do not let
+# anyone (including an LLM) pre-populate client mappings for you — author and
+# sign off yourself.
+#
+# Worked reference values from the four known clients appear in comments as
+# "e.g." — they are illustrations, NOT defaults to copy.
+# =============================================================================
+
+config_version: "<FILL: e.g. 1.0.0>"      # bump on every change; lands in lineage
+
+client:
+  code:            "<FILL: short code, e.g. SOC | USCC | KAPITUS | TIB>"
+  name:            "<FILL: e.g. SnapOn Credit>"
+  domain:          "<FILL: e.g. consumer/commercial credit | telecom | SMB MCA | bank>"
+  geographies:     ["<FILL: e.g. USA, CAN>"]        # drives bureau routing & jurisdiction rules
+  schema_version:  "<FILL: target Standard Schema version, e.g. 1.1>"
+  sdd_path:        "<FILL: path to client SDD json, e.g. SOC/sdd/SnapOn_SDD.json>"
+  gds_versions:    ["<FILL: all engine versions seen, e.g. 1.3.14, 1.3.15, 1.3.16>"]
+  # Extension namespace keeps client-specific fields OUT of core schema so they
+  # never pollute cross-client analytics. Everything not in core SS lands here.
+  extension_namespace: "<FILL: e.g. <CLIENT>_*  ->  written under extraColumns{}>"
+
+# -----------------------------------------------------------------------------
+# 1. SOURCE PACKAGE STRUCTURE
+#    Which folders exist, whether they're required, and their PRIORITY ORDER.
+#    Priority order is how the engine resolves a field present in >1 folder.
+# -----------------------------------------------------------------------------
+package:
+  # List folders highest-priority first. Engine resolves multi-source fields
+  # by walking this order and taking the first present, non-null source
+  # (unless a specific field overrides it in the mapping sheet).
+  # e.g. USCC/Kapitus: cc_extracts > data > raw > audit ; SOC: raw/data/audit/sdd/cc
+  folder_priority:
+    - { name: "<FILL: e.g. cc_extracts>", required: false, present_but_empty_ok: true }
+    - { name: "<FILL: e.g. data>",        required: true,  filetype: "<FILL: json>" }
+    - { name: "<FILL: e.g. raw>",         required: true,  filetype: "<FILL: txt/http-wire>" }
+    - { name: "<FILL: e.g. audit>",       required: true,  filetype: "<FILL: json>" }
+    - { name: "<FILL: e.g. sdd>",         required: false, filetype: "<FILL: json>" }
+  # Gracefully handle folders that are present but contain zero files
+  # (USCC & Kapitus cc_extracts/ are empty in UAT).
+  tolerate_empty_folders: true
+
+# -----------------------------------------------------------------------------
+# 2. APPLICATION ID  —  parse + identity rules
+# -----------------------------------------------------------------------------
+application_id:
+  # Choose ONE source strategy:
+  #   filename_tokens : parse the App ID out of the filename (SOC pattern)
+  #   payload_field   : read it from a connector field (USCC/Kapitus/TIB pattern)
+  source: "<FILL: filename_tokens | payload_field>"
+
+  # If source == filename_tokens (SOC):
+  filename:
+    # Use named regex groups; engine maps groups -> canonical fields below.
+    pattern: '<FILL: e.g. ^(?P<version>v\d+)_(?P<geo>CAN|USA)_(?P<debtor>\d{9})_(?P<dt>\d{14})(?P<test>_test)?_(?P<connector>C\d+)_.*\.\w+$>'
+    canonical_app_id_groups: ["<FILL: e.g. debtor, dt>"]   # groups concatenated -> canonical id
+    datetime_group: "<FILL: e.g. dt>"
+    datetime_format: "<FILL: e.g. %Y%m%d%H%M%S>"
+
+  # If source == payload_field (USCC/Kapitus/TIB):
+  payload:
+    # ordered candidate paths; first present wins (mirrors source priority)
+    candidate_paths:
+      - { connector: "<FILL: e.g. C4871>", folder: "<FILL: data>", direction: "<FILL: REQ>", path: "<FILL: e.g. data.Request.contract_id>" }
+      - { connector: "<FILL: e.g. C13185>", folder: "<FILL: raw>", direction: "<FILL: RESP>", path: "<FILL: e.g. record.ApplicationID>" }
+
+  # Storage type — CRITICAL. e.g. USCC 20-digit IDs overflow INT64.
+  storage_type: "<FILL: ALWAYS VARCHAR — never INTEGER>"
+
+  # Optional suffix handling (SOC `_test`). strip -> store canonical; flag in lineage.
+  suffix_rules:
+    - { suffix: "<FILL: e.g. _test>", action: "<FILL: strip|exclude|separate_partition>", flag_lineage: true }
+
+  # If no App ID is present in any source, how to synthesise (TIB UUID-seed).
+  synthesise_when_absent: "<FILL: none | uuidv4_seeded_from:<FILL fields> >"
+
+# -----------------------------------------------------------------------------
+# 3. SESSION MODEL  —  how files group into one output record per App ID
+# -----------------------------------------------------------------------------
+sessions:
+  # composite grouping key (engine groups files by these, in order)
+  group_key: ["<FILL: e.g. app_id, sequence_id>"]
+  # request/response pairing key within a group
+  pair_key:  ["<FILL: e.g. connector_code, step_num>"]
+
+  model: "<FILL: single | multi_session_merge | mixed>"
+
+  # multi_session_merge (SOC CAN): expect N sessions, merge into one record
+  multi_session:
+    expected_sessions: "<FILL: e.g. 2>"
+    session_definitions:
+      - { name: "<FILL: e.g. transunion>", connectors: ["<FILL: C161655>"], order: 1 }
+      - { name: "<FILL: e.g. equifax>",    connectors: ["<FILL: C161658>"], order: 2 }
+    incomplete_action: "<FILL: quarantine + set lineage.multi_session_incomplete=true>"
+    # optional ordering sanity (SOC REQ-BL-002: equifax later than transunion)
+    order_checks: ["<FILL: e.g. equifax.timestamp > transunion.timestamp>"]
+
+  # Connectors that fire more than once and must be disambiguated by step
+  # (USCC transunion_call_1/2, billing_call_1/2; Kapitus C704672 etc.)
+  multi_fire_connectors:
+    - { connector: "<FILL: e.g. C25755>", steps: ["<FILL: 8, 11>"], labels: ["<FILL: transunion_call_1, transunion_call_2>"] }
+
+  # Special session classes to handle gracefully
+  audit_only: "<FILL: produce minimal lineage record; has_connector_data=false>"   # USCC/Kapitus
+  async_ack:  "<FILL: how to treat REQ-only async sessions, if any>"               # Kapitus C704672
+
+  dedup: "<FILL: e.g. USA retries deduped by latest timestamp>"
+
+# -----------------------------------------------------------------------------
+# 4. PRE-PROCESSING  —  transforms applied BEFORE field mapping
+#    NOTE: credential scrub is an ENGINE INVARIANT (always step 1). You declare
+#    WHERE the credentials are; the engine guarantees WHEN (first) it runs.
+# -----------------------------------------------------------------------------
+preprocess:
+  # 4a. Credential scrub locations (invariant: runs first, before any logging)
+  credential_scrub:
+    # method: redact | null_out | delete_field | discard_payload
+    - { connector: "<FILL: e.g. C161653>", folder: "<FILL: raw>", location: "<FILL: HTTP Authorization header>", method: "<FILL: redact>" }
+    - { connector: "<FILL: e.g. C39255>",  folder: "<FILL: raw>", location: "<FILL: entire payload (OAuth)>",   method: "<FILL: discard_payload>" }
+    # Also list non-credential secrets that must be scrubbed at strip time,
+    # e.g. Kapitus SSN in plaintext in C628615/C656898 REQ, EncryptionKey values.
+    - { connector: "<FILL: e.g. C628615>", folder: "<FILL: raw>", location: "<FILL: PersonCriteria.SSN plaintext>", method: "<FILL: redact>", critical: true }
+
+  # 4b. HTTP envelope strip (raw/ wire payloads). Split on CRLFCRLF.
+  http_envelope_strip:
+    apply_to_folders: ["<FILL: e.g. raw>"]
+
+  # 4c. GZIP decompress (detect 0x1f8b magic)  — Kapitus C378674, C409480, ...
+  gzip_decompress:
+    auto_detect: true
+    connectors: ["<FILL: list or 'auto'>"]
+
+  # 4d. Encoding normalisation
+  encoding:
+    accept: ["<FILL: e.g. UTF-8, ISO-8859-1>"]
+    normalise_to: "UTF-8"
+
+  # 4e. Nested / stringified payload extraction
+  nested_parse:
+    # base64 blob -> decode -> parse (SOC C103403 double-parse; Kapitus btData)
+    base64:
+      - { connector: "<FILL: e.g. C103403>", field: "<FILL: payload>", then: "<FILL: json>", min_attributes: "<FILL: e.g. 100 sanity check>" }
+    # stringified-JSON double/triple parse (USCC C23612; Kapitus C411966/C373382)
+    json_multiparse:
+      - { connector: "<FILL: e.g. C23612>", fields: ["<FILL: equifaxconsumerbureau_report, ...>"], depth: "<FILL: 2 (double) | 3 (triple)>" }
+
+  # 4f. Large blob / binary handling -> object storage, leave external_ref URI
+  external_ref:
+    size_threshold_kb: "<FILL: e.g. 50>"
+    binary_pdf: "<FILL: detect %PDF -> object storage -> documents[].documentUrl>"   # Kapitus C628492/C702265
+    object_store_uri_pattern: "<FILL: e.g. s3://dg-forge/<CLIENT>/{app_id}/{connector}/{field}>"
+
+# -----------------------------------------------------------------------------
+# 5. CONNECTOR INVENTORY  —  one entry per connector code
+#    parse_strategy must be one of the engine's registered strategies (see
+#    references/mapping_schema.md §Parse Strategies). Add new strategies in the
+#    engine, not here.
+# -----------------------------------------------------------------------------
+connectors:
+  - code:           "<FILL: e.g. C161651>"
+    name:           "<FILL: e.g. EquifaxUSA>"
+    folders:        ["<FILL: e.g. raw>"]            # may appear in more than one
+    direction:      "<FILL: REQ | RESP | REQ+RESP | REQ only>"
+    wire_format:    "<FILL: gds_json | http_json | http_xml | fff | soap_xml | sql | multipart_pdf | http_pdf>"
+    parse_strategy: "<FILL: gds_envelope_json | raw_json | xml_dict | fff | soap_xml | binary_external_ref | credential_discard>"
+    call_types:     ["<FILL: which call types fire this connector>"]
+    is_credential:  false        # true -> never mapped; scrub only
+    has_pii:        false        # true -> ensure all PII fields appear in §7
+    notes:          "<FILL: role, key payload fields, gotchas>"
+  # ... repeat per connector. SOC=12, USCC=25, Kapitus=39, TIB~7.
+
+# -----------------------------------------------------------------------------
+# 6. DECISION EXTRACTION  +  cross-client code normalisation
+# -----------------------------------------------------------------------------
+decision:
+  source:
+    connector: "<FILL: e.g. C754889 | audit | C440687>"
+    folder:    "<FILL: data | audit | raw>"
+    direction: "<FILL: RESP>"
+    decision_path:        "<FILL: e.g. DecisionCode | audit.properties.decision | Request.event_type>"
+    description_path:     "<FILL: e.g. DecisionDescription>"
+    reason_codes_path:    "<FILL: e.g. Dec_Reasons>"
+    reason_codes_delim:   "<FILL: e.g. | >"
+    stipulations_path:    "<FILL: e.g. Stipulations>"
+    stipulations_delim:   "<FILL: e.g. | >"
+    call_type_path:       "<FILL: e.g. ApplicationCallType | properties.calltype>"
+  tentative: "<FILL: true/false — e.g. Kapitus event_type proxy is TENTATIVE pending client sign-off>"
+  # Map client-native decision codes -> shared cross-client vocabulary so that
+  # approval/decline rates are comparable across clients later.
+  code_normalisation:
+    # client_code: SHARED_CODE   (SHARED ∈ {APPROVED, DECLINED, REVIEW, ERROR, INCOMPLETE})
+    "<FILL: e.g. APP>": "APPROVED"
+    "<FILL: e.g. DEC>": "DECLINED"
+    "<FILL: e.g. REV>": "REVIEW"
+
+# -----------------------------------------------------------------------------
+# 7. PII INVENTORY  +  tokenisation method
+#    (invariant: tokenisation runs before any write; post-write zero-raw-PII
+#     assertion is enforced by the engine regardless of this section.)
+# -----------------------------------------------------------------------------
+pii:
+  # method: pseudonym_reversible (vault) | oneway_hash | scrub_never_store (DL=N) | year_only
+  fields:
+    - { name: "<FILL: firstName>",   connectors: ["<FILL>"], method: "<FILL: pseudonym_reversible>" }
+    - { name: "<FILL: ssn/sin>",     connectors: ["<FILL>"], method: "<FILL: oneway_hash>" }
+    - { name: "<FILL: accountNumber>", connectors: ["<FILL>"], method: "<FILL: scrub_never_store>" }   # Kapitus DL=N
+  # Scan EVERY extraColumns value for PII patterns before write (USCC/Kapitus REQ-VAL-10)
+  extra_columns_scan:
+    enabled: true
+    patterns: ["<FILL: ssn, fein, ach, email, phone>"]
+  # FCRA / compliance: extract report dates BEFORE tokenising bureau blocks
+  preserve_for_compliance: ["<FILL: e.g. creditProfile.reportDate>"]
+
+# -----------------------------------------------------------------------------
+# 8. EXTRA COLUMNS  —  named groups for fields with no core-schema home
+# -----------------------------------------------------------------------------
+extra_columns_groups:
+  - { group: "<FILL: e.g. <CLIENT>_analytic_extract>", connectors: ["<FILL>"], notes: "<FILL: purpose / candidate for future schema extension>" }
+
+# -----------------------------------------------------------------------------
+# 9. VALIDATION  —  enable engine rules + client-specific params
+#    Rule library lives in the engine (REQ-VAL-* / REQ-BL-*). Here you only
+#    enable/parameterise. Add new rules in the engine and reference them here.
+# -----------------------------------------------------------------------------
+validation:
+  hard_quarantine_rules:   ["<FILL: e.g. REQ-VAL-001, 002, 005, 007, 008>"]   # block write
+  soft_warn_rules:         ["<FILL: e.g. REQ-VAL-004, 006, REQ-BL-001..005>"]
+  client_params:
+    expected_sessions: "<FILL: e.g. 2 for CAN, 1 for USA>"
+    valid_geographies: ["<FILL: USA, CAN>"]
+    valid_call_types:  ["<FILL: enum — engine rejects others>"]
+  quarantine_report: "<FILL: e.g. daily report to Data Engineering>"
+
+# -----------------------------------------------------------------------------
+# 10. OPEN QUESTIONS  —  unresolved items that block/caveat the build
+#     (every client doc had these; keep them in-config so the engine can emit
+#      a warning when an affected path is exercised.)
+# -----------------------------------------------------------------------------
+open_questions:
+  - { id: "<FILL: Q1>", question: "<FILL>", impact: "<FILL>", blocks_production: "<FILL: true/false>" }
