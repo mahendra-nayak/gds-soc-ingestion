@@ -268,6 +268,49 @@ def _scrub_redact(sf: SourceFile, rule: dict) -> None:
     sf.raw_bytes = re.sub(pattern, replacement, text).encode("utf-8")
 
 
+def _scrub_null_out(sf: SourceFile, rule: dict) -> None:
+    """Pattern-based field nulling for form-encoded or plain-text payloads (INV-01).
+
+    Matches field names from rule['field_pattern'] followed by '=' and nulls
+    the value (empties the value string, preserving the key and delimiter).
+    Overwrites sf.raw_bytes in-place.
+
+    Default field pattern targets common password field names (C754889 use-case).
+    """
+    text = _load_raw_text(sf)
+    if text is None:
+        return
+    field_pattern = rule.get("field_pattern", r"password|passwd|pwd|pass")
+    sf.raw_bytes = re.sub(
+        rf"((?:{field_pattern})=)[^&\r\n]*",
+        r"\1",
+        text,
+        flags=re.IGNORECASE,
+    ).encode("utf-8")
+
+
+def _scrub_json_body(sf: SourceFile, rule: dict) -> None:
+    """Pattern-based JSON body credential field scrub (INV-01).
+
+    After HTTP envelope strip is not required — the regex safely applies to
+    the full raw bytes (HTTP headers will not contain JSON body keys).
+    Matches JSON string values for keys matching rule['field_pattern'] and
+    replaces with rule['replacement'].  Overwrites sf.raw_bytes in-place.
+
+    Default targets bearer/access token fields (C103403 use-case).
+    """
+    text = _load_raw_text(sf)
+    if text is None:
+        return
+    field_pattern = rule.get("field_pattern", r"bearer.?token|access.?token|api.?key")
+    replacement = rule.get("replacement", "[SCRUBBED]")
+    sf.raw_bytes = re.sub(
+        rf'(?i)("(?:{field_pattern})"\s*:\s*)"[^"]*"',
+        rf'\1"{replacement}"',
+        text,
+    ).encode("utf-8")
+
+
 # =============================================================================
 # 3. PRE-PROCESS — strip / decompress / decode / multiparse / externalise
 # =============================================================================
