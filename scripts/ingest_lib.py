@@ -78,6 +78,7 @@ class SourceFile:
     payload: Any = None            # populated after parse
     raw_bytes: bytes | None = None
     geography: str | None = None   # USA | CAN | None (unclassified / unrecognised)
+    datetime: "datetime | None" = None  # file-level timestamp (set from filename or payload)
 
 
 @dataclass
@@ -512,23 +513,89 @@ def dispatch_by_geo(files: list[SourceFile]) -> dict[str, list[SourceFile]]:
 
 
 def group_by_app(files: list[SourceFile], cfg: ClientConfig) -> dict[str, AppRecord]:
+    """Group SourceFiles into AppRecords by canonical App ID.
+
+    Single purpose: partition + dedup + quarantine-flag per-group.
+    INV-07 / D-10: canonical and raw IDs stored as VARCHAR strings throughout.
+    INV-09: records with _test suffix quarantined (not written to DataLake=Y).
+    D-02: cross-debtor mismatch within a group quarantined.
+    """
     apps: dict[str, AppRecord] = {}
     for sf in files:
         if not sf.app_id_raw:
             continue
-        canonical = _canonicalise_app_id(sf.app_id_raw, cfg)
-        rec = apps.setdefault(canonical, AppRecord(canonical, sf.app_id_raw))
+        canonical, had_test = _canonicalise_app_id(sf.app_id_raw, cfg)
+        if canonical not in apps:
+            rec = AppRecord(canonical, sf.app_id_raw)
+            rec.lineage["app_id_raw"] = sf.app_id_raw         # IC-3: preserved
+            rec.lineage["app_id_canonical"] = canonical        # IC-3: preserved
+            apps[canonical] = rec
+        rec = apps[canonical]
+        if had_test:
+            rec.lineage["app_id_raw_had_test_suffix"] = True
         rec.files.append(sf)
+
+    for rec in apps.values():
+        # Dedup retry files before any further checks
+        rec.files = _dedup_retry_files(rec.files)
+
+        # INV-09: quarantine _test records — never write to DataLake=Y
+        if rec.lineage.get("app_id_raw_had_test_suffix"):
+            rec.quarantined = True
+            rec.lineage["test_quarantine"] = True
+            # TODO(Q3): when separate_partition confirmed, route here instead of quarantine
+
+        # D-02: all files in a group must share the same debtor number
+        _check_group_debtor_consistency(rec)
+
     return apps
 
 
-def _canonicalise_app_id(raw: str, cfg: ClientConfig) -> str:
+def _canonicalise_app_id(raw: str, cfg: ClientConfig) -> tuple[str, bool]:
+    """Return (canonical_id, had_test_suffix).
+
+    Applies suffix_rules from config. INV-07 / D-10: returns VARCHAR string,
+    no numeric coercion at any point.
+    """
     out = raw
+    had_test = False
     for rule in cfg["application_id"].get("suffix_rules", []) or []:
         suf = rule.get("suffix")
         if suf and out.endswith(suf) and rule.get("action") == "strip":
             out = out[: -len(suf)]
-    return out
+            if suf == "_test":
+                had_test = True
+    return out, had_test
+
+
+def _dedup_retry_files(files: list[SourceFile]) -> list[SourceFile]:
+    """Remove duplicate retry files, keeping the latest by filename sort.
+
+    Two files are duplicates when they share (connector, direction, sequence_id).
+    Sorted ascending by path name so the last entry (latest filename timestamp)
+    overwrites earlier ones.  INV-07: sequence_id compared as string — no cast.
+    """
+    seen: dict[tuple, SourceFile] = {}
+    for sf in sorted(files, key=lambda f: f.path.name):
+        key = (sf.connector, sf.direction, sf.sequence_id)
+        seen[key] = sf
+    return list(seen.values())
+
+
+def _check_group_debtor_consistency(rec: AppRecord) -> None:
+    """D-02 (group-level): all files in a group must share one debtor number.
+
+    Debtor number is the leading component of app_id_raw before the first '_'.
+    INV-07: compared as strings only.
+    """
+    debtors = {
+        sf.app_id_raw.split("_")[0]
+        for sf in rec.files
+        if sf.app_id_raw
+    }
+    if len(debtors) > 1:
+        rec.quarantined = True
+        rec.validation_failures.append("D-02-cross-session-identity-mismatch")
 
 
 def merge_sessions(rec: AppRecord, cfg: ClientConfig) -> None:
