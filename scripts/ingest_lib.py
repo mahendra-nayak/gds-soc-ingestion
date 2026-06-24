@@ -324,6 +324,37 @@ def maybe_gunzip(body: bytes) -> bytes:
     return gzip.decompress(body) if body[:2] == b"\x1f\x8b" else body
 
 
+def normalise_encoding(body: bytes, accept: str, target: str = "utf-8") -> bytes:
+    """Normalise body bytes to the target encoding (default UTF-8).
+
+    Strategy:
+      1. Try UTF-8. If valid, re-encode to target (no-op when target=='utf-8').
+      2. If UnicodeDecodeError, fall back to ISO-8859-1.
+      3. If both fail, raise ValueError with the connector code for traceability.
+
+    Args:
+        body:   raw bytes to normalise.
+        accept: connector code or content-type hint — included in error message only.
+        target: target encoding (default 'utf-8').
+    """
+    for encoding in ("utf-8", "iso-8859-1"):
+        try:
+            decoded = body.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        try:
+            return decoded.encode(target)
+        except UnicodeEncodeError:
+            raise ValueError(
+                f"Cannot re-encode body for connector {accept}: "
+                f"characters not representable in {target!r}"
+            )
+    raise ValueError(
+        f"Cannot decode body for connector {accept}: "
+        f"not valid UTF-8 or ISO-8859-1"
+    )
+
+
 def extract_base64_blob(value: str) -> bytes:
     return base64.b64decode(value)
 
