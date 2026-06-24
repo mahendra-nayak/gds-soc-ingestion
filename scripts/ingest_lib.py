@@ -217,16 +217,55 @@ def scrub_credentials(files: list[SourceFile], cfg: ClientConfig) -> list[str]:
 
 
 def _apply_scrub(sf: SourceFile, rule: dict) -> None:
+    """Dispatch to the appropriate scrub implementation.
+
+    INV-01: all methods use pattern-based detection — never exact-match of known
+    credential values.  raw_bytes is overwritten in-place so no downstream
+    function can access the unredacted value.
+    """
     method = rule["method"]
     if method == "discard_payload":
         sf.raw_bytes = b"[SCRUBBED_PAYLOAD]"
         sf.payload = None
-    # redact / null_out / delete_field operate on the located field/header.
-    # TODO(team): implement located-field redaction using rule['location'].
-    # Use PATTERN-based detection, not exact match (SOC R7), so a new credential
-    # format in production is still caught.
+    elif method == "redact":
+        _scrub_redact(sf, rule)
+    elif method == "null_out":
+        _scrub_null_out(sf, rule)
+    elif method == "scrub_json_body":
+        _scrub_json_body(sf, rule)
     if rule.get("critical"):
         log.warning("CRITICAL scrub applied to %s (%s)", sf.connector, rule.get("location"))
+
+
+def _load_raw_text(sf: SourceFile) -> str | None:
+    """Read sf.raw_bytes (loading from disk if needed) and decode to str."""
+    if sf.raw_bytes is None:
+        sf.raw_bytes = sf.path.read_bytes()
+    try:
+        return sf.raw_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+def _scrub_redact(sf: SourceFile, rule: dict) -> None:
+    """Pattern-based regex redaction in raw bytes (INV-01).
+
+    Applies rule['pattern'] regex to the decoded payload text and replaces
+    matches with rule['replacement'].  Overwrites sf.raw_bytes in-place.
+
+    Default pattern targets HTTP Authorization header (C161653 use-case).
+    """
+    text = _load_raw_text(sf)
+    if text is None:
+        return
+    # NOTE: EXECUTION_PLAN specifies r'(?i)(Authorization:\s*)\S+' but \S+
+    # matches only the scheme word (e.g. 'Bearer'), leaving the token value
+    # intact.  IC-4 requires zero credential in persisted records, so the
+    # correct pattern must match the entire header value to end-of-line.
+    # Using [^\r\n]+ here; rule['pattern'] overrides for non-default cases.
+    pattern = rule.get("pattern", r"(?i)(Authorization:\s*)[^\r\n]+")
+    replacement = rule.get("replacement", r"\1[REDACTED]")
+    sf.raw_bytes = re.sub(pattern, replacement, text).encode("utf-8")
 
 
 # =============================================================================
