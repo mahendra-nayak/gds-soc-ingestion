@@ -217,16 +217,98 @@ def scrub_credentials(files: list[SourceFile], cfg: ClientConfig) -> list[str]:
 
 
 def _apply_scrub(sf: SourceFile, rule: dict) -> None:
+    """Dispatch to the appropriate scrub implementation.
+
+    INV-01: all methods use pattern-based detection — never exact-match of known
+    credential values.  raw_bytes is overwritten in-place so no downstream
+    function can access the unredacted value.
+    """
     method = rule["method"]
     if method == "discard_payload":
         sf.raw_bytes = b"[SCRUBBED_PAYLOAD]"
         sf.payload = None
-    # redact / null_out / delete_field operate on the located field/header.
-    # TODO(team): implement located-field redaction using rule['location'].
-    # Use PATTERN-based detection, not exact match (SOC R7), so a new credential
-    # format in production is still caught.
+    elif method == "redact":
+        _scrub_redact(sf, rule)
+    elif method == "null_out":
+        _scrub_null_out(sf, rule)
+    elif method == "scrub_json_body":
+        _scrub_json_body(sf, rule)
     if rule.get("critical"):
         log.warning("CRITICAL scrub applied to %s (%s)", sf.connector, rule.get("location"))
+
+
+def _load_raw_text(sf: SourceFile) -> str | None:
+    """Read sf.raw_bytes (loading from disk if needed) and decode to str."""
+    if sf.raw_bytes is None:
+        sf.raw_bytes = sf.path.read_bytes()
+    try:
+        return sf.raw_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+def _scrub_redact(sf: SourceFile, rule: dict) -> None:
+    """Pattern-based regex redaction in raw bytes (INV-01).
+
+    Applies rule['pattern'] regex to the decoded payload text and replaces
+    matches with rule['replacement'].  Overwrites sf.raw_bytes in-place.
+
+    Default pattern targets HTTP Authorization header (C161653 use-case).
+    """
+    text = _load_raw_text(sf)
+    if text is None:
+        return
+    # NOTE: EXECUTION_PLAN specifies r'(?i)(Authorization:\s*)\S+' but \S+
+    # matches only the scheme word (e.g. 'Bearer'), leaving the token value
+    # intact.  IC-4 requires zero credential in persisted records, so the
+    # correct pattern must match the entire header value to end-of-line.
+    # Using [^\r\n]+ here; rule['pattern'] overrides for non-default cases.
+    pattern = rule.get("pattern", r"(?i)(Authorization:\s*)[^\r\n]+")
+    replacement = rule.get("replacement", r"\1[REDACTED]")
+    sf.raw_bytes = re.sub(pattern, replacement, text).encode("utf-8")
+
+
+def _scrub_null_out(sf: SourceFile, rule: dict) -> None:
+    """Pattern-based field nulling for form-encoded or plain-text payloads (INV-01).
+
+    Matches field names from rule['field_pattern'] followed by '=' and nulls
+    the value (empties the value string, preserving the key and delimiter).
+    Overwrites sf.raw_bytes in-place.
+
+    Default field pattern targets common password field names (C754889 use-case).
+    """
+    text = _load_raw_text(sf)
+    if text is None:
+        return
+    field_pattern = rule.get("field_pattern", r"password|passwd|pwd|pass")
+    sf.raw_bytes = re.sub(
+        rf"((?:{field_pattern})=)[^&\r\n]*",
+        r"\1",
+        text,
+        flags=re.IGNORECASE,
+    ).encode("utf-8")
+
+
+def _scrub_json_body(sf: SourceFile, rule: dict) -> None:
+    """Pattern-based JSON body credential field scrub (INV-01).
+
+    After HTTP envelope strip is not required — the regex safely applies to
+    the full raw bytes (HTTP headers will not contain JSON body keys).
+    Matches JSON string values for keys matching rule['field_pattern'] and
+    replaces with rule['replacement'].  Overwrites sf.raw_bytes in-place.
+
+    Default targets bearer/access token fields (C103403 use-case).
+    """
+    text = _load_raw_text(sf)
+    if text is None:
+        return
+    field_pattern = rule.get("field_pattern", r"bearer.?token|access.?token|api.?key")
+    replacement = rule.get("replacement", "[SCRUBBED]")
+    sf.raw_bytes = re.sub(
+        rf'(?i)("(?:{field_pattern})"\s*:\s*)"[^"]*"',
+        rf'\1"{replacement}"',
+        text,
+    ).encode("utf-8")
 
 
 # =============================================================================
@@ -240,6 +322,37 @@ def http_envelope_strip(raw: bytes) -> bytes:
 
 def maybe_gunzip(body: bytes) -> bytes:
     return gzip.decompress(body) if body[:2] == b"\x1f\x8b" else body
+
+
+def normalise_encoding(body: bytes, accept: str, target: str = "utf-8") -> bytes:
+    """Normalise body bytes to the target encoding (default UTF-8).
+
+    Strategy:
+      1. Try UTF-8. If valid, re-encode to target (no-op when target=='utf-8').
+      2. If UnicodeDecodeError, fall back to ISO-8859-1.
+      3. If both fail, raise ValueError with the connector code for traceability.
+
+    Args:
+        body:   raw bytes to normalise.
+        accept: connector code or content-type hint — included in error message only.
+        target: target encoding (default 'utf-8').
+    """
+    for encoding in ("utf-8", "iso-8859-1"):
+        try:
+            decoded = body.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        try:
+            return decoded.encode(target)
+        except UnicodeEncodeError:
+            raise ValueError(
+                f"Cannot re-encode body for connector {accept}: "
+                f"characters not representable in {target!r}"
+            )
+    raise ValueError(
+        f"Cannot decode body for connector {accept}: "
+        f"not valid UTF-8 or ISO-8859-1"
+    )
 
 
 def extract_base64_blob(value: str) -> bytes:
