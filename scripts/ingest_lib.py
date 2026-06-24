@@ -370,8 +370,34 @@ def _connector_cfg(code: str | None, cfg: ClientConfig) -> dict | None:
 
 
 # =============================================================================
-# 5. GROUP + MERGE — one record per App ID
+# 5. GEO DISPATCH + GROUP + MERGE
 # =============================================================================
+def dispatch_by_geo(files: list[SourceFile]) -> dict[str, list[SourceFile]]:
+    """Partition files into {'USA': [...], 'CAN': [...]}.
+
+    Single purpose: geography-based routing only.
+    INV-10: routing is explicit and deterministic — no default, no inference.
+    Files with geography not in ('USA', 'CAN') are unroutable and logged as errors.
+    Both partition keys are always present in the return value, even if empty.
+    CQ-001: single purpose; loop nesting ≤ 2 levels.
+    """
+    partitions: dict[str, list[SourceFile]] = {"USA": [], "CAN": []}
+    unroutable: list[SourceFile] = []
+
+    for sf in files:
+        if sf.geography in ("USA", "CAN"):
+            partitions[sf.geography].append(sf)
+        else:
+            unroutable.append(sf)
+
+    for sf in unroutable:
+        log.error(
+            "QUARANTINE geo=None/unrecognised file=%s — INV-10", sf.path.name
+        )
+
+    return partitions
+
+
 def group_by_app(files: list[SourceFile], cfg: ClientConfig) -> dict[str, AppRecord]:
     apps: dict[str, AppRecord] = {}
     for sf in files:
