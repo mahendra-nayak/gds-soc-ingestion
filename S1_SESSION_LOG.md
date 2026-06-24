@@ -70,7 +70,7 @@
 | 1.2 | Sample ZIP Fixture + Manifest Smoke Test | Completed | 04b2d5d |
 | 1.3 | Filename Parser: App ID, Geo, Connector, Sequence | Completed | 15eb12e |
 | 1.4 | Geo Dispatcher | Completed | c39b621 |
-| 1.5 | Wire dispatch_by_geo() into run_pipeline() | | |
+| 1.5 | Wire dispatch_by_geo() into run_pipeline() | Completed | 6294f2e |
 
 Valid Status values: Completed | BLOCKED | SKIPPED
 
