@@ -1,0 +1,32 @@
+# assets/client_config_template.yaml
+# Template only — do not fill placeholders here.
+# Copy to client_config.SOC_<REGION>.yaml and populate per task assignment.
+
+client_code: <FILL: SOC_USA | SOC_CAN>
+client_name: <FILL: full client name>
+region: <FILL: USA | CAN>
+schema_version: "1.1"
+
+pipeline:
+  default_parse_strategy: <FILL: gds_envelope_json | raw_json | xml_dict | soap_xml | fff | binary_external_ref | credential_discard>
+  dedup_enabled: <FILL: true | false>
+  quarantine_on_error: <FILL: true | false>
+
+pii:
+  fields:
+    - <FILL: field_name_1>
+    - <FILL: field_name_2>
+  tokenisation_prefix: "TOK_"
+
+connectors:
+  - id: <FILL: connector_id e.g. C161653>
+    name: <FILL: connector name>
+    parse_strategy: <FILL: strategy name>
+    credential_fields:
+      - <FILL: credential field name>
+
+field_mapping_file: <FILL: assets/field_mapping.SOC_<REGION>.xlsx>
+
+data_lake:
+  adapter: <FILL: TODO — team>
+  target_table: <FILL: table name>
