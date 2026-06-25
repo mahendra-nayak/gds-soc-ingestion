@@ -787,12 +787,53 @@ def _row_from_cells(r, header) -> MappingRow:
 
 def apply_mapping(rec: AppRecord, mapping: list[MappingRow], cfg: ClientConfig) -> None:
     """For each SDD path, resolve by source priority and write into rec.record."""
+    _extract_decision(rec)
     for row in mapping:
         value = resolve_source(rec, row, cfg)
         if value is None:
             continue
         value = apply_transform(value, row, rec, cfg)
         _set_path(rec.record, row.sdd_path, value)
+    _check_decline_completeness(rec)
+
+
+def _extract_decision(rec: AppRecord) -> None:
+    """D-04: extract decision from C238743-RESP only; never from audit/ folder."""
+    for sf in rec.files:
+        if sf.folder == "audit":        # D-04 guard
+            continue
+        if sf.connector != "C238743" or sf.direction != "RESP":
+            continue
+        if sf.payload is None:
+            break
+        val = _get_nested(sf.payload, "Decision.decision")
+        if val:
+            _set_path(rec.record, "system.application.decision", val)
+            apr = _get_nested(sf.payload, "Decision.interestrate")
+            if apr is not None:
+                _set_path(rec.record, "system.application.apr", apr)
+            return
+        break
+    # C238743-RESP absent or decision field missing
+    rec.lineage["decision_missing"] = True
+    rec.validation_failures.append("REQ-VAL-006")
+
+
+def _check_decline_completeness(rec: AppRecord) -> None:
+    """D-03: DECLINED + empty reason codes → REQ-BL-001 soft-warn (not a quarantine)."""
+    decision = _get_path(rec.record, "system.application.decision")
+    reason_codes = _get_path(rec.record, "system.application.decisionSummary.reasonCodes") or []
+    if str(decision or "").upper() == "DECLINED" and len(reason_codes) == 0:
+        rec.validation_failures.append("REQ-BL-001")
+        rec.lineage["reason_codes_missing"] = True
+
+
+def _check_score_slot_bounds(rec: AppRecord) -> None:
+    """Slot bounding: SOC maps scores 1-3 only; slots 4-14 must remain unpopulated."""
+    for slot in range(4, 15):
+        key = f"system.application.scores.score{slot}"
+        if _get_path(rec.record, key) is not None:
+            raise ValueError(f"Score slot {slot} populated for SOC — mapping error")
 
 
 def resolve_source(rec: AppRecord, row: MappingRow, cfg: ClientConfig) -> Any:
@@ -1065,3 +1106,20 @@ def _set_path(obj: dict, dotted: str, value: Any) -> None:
     for p in parts[:-1]:
         cur = cur.setdefault(p, {})
     cur[parts[-1]] = value
+
+
+def _get_nested(obj: Any, dotted: str) -> Any:
+    """Dotted-path read into a parsed payload dict. Returns None on any miss."""
+    cur = obj
+    for part in dotted.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+        if cur is None:
+            return None
+    return cur
+
+
+def _get_path(obj: dict, dotted: str) -> Any:
+    """Dotted-path read from rec.record (same semantics as _get_nested)."""
+    return _get_nested(obj, dotted)
