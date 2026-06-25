@@ -639,6 +639,13 @@ def merge_sessions(rec: AppRecord, cfg: ClientConfig) -> None:
 _CAN_SESSION1_CONNECTORS: frozenset[str] = frozenset({"C100810"})
 _CAN_SESSION2_CONNECTORS: frozenset[str] = frozenset({"C161653", "C161796"})
 
+# D-09: bureau provider routing (connector → provider sub-key under bureauData)
+_BUREAU_PROVIDER_MAP: dict[str, str] = {
+    "C100810": "transunion",
+    "C161796": "equifax",
+    "C161653": "equifax",
+}
+
 
 def _detect_can_sessions(rec: AppRecord) -> None:
     """Detect CAN bureau evaluation sessions by connector presence only.
@@ -796,6 +803,8 @@ def apply_mapping(rec: AppRecord, mapping: list[MappingRow], cfg: ClientConfig) 
         _set_path(rec.record, row.sdd_path, value)
     _check_score_slot_bounds(rec)
     _check_decline_completeness(rec)
+    _set_bureau_provider_lineage(rec)
+    _assert_bureau_attribution(rec)
 
 
 def _extract_decision(rec: AppRecord) -> None:
@@ -827,6 +836,31 @@ def _check_decline_completeness(rec: AppRecord) -> None:
     if str(decision or "").upper() == "DECLINED" and len(reason_codes) == 0:
         rec.validation_failures.append("REQ-BL-001")
         rec.lineage["reason_codes_missing"] = True
+
+
+def _set_bureau_provider_lineage(rec: AppRecord) -> None:
+    """D-09: populate rec.lineage['bureau_providers'] from present bureau connectors."""
+    providers = {
+        _BUREAU_PROVIDER_MAP[sf.connector]
+        for sf in rec.files
+        if sf.connector in _BUREAU_PROVIDER_MAP
+    }
+    if providers:
+        rec.lineage["bureau_providers"] = sorted(providers)
+
+
+def _assert_bureau_attribution(rec: AppRecord) -> None:
+    """D-09: no field may exist directly at rec.record['bureauData'] root.
+    All bureau-derived fields must live under a provider sub-key."""
+    bureau_data = rec.record.get("bureauData")
+    if bureau_data is None:
+        return
+    allowed = {"transunion", "equifax"}
+    unexpected = {k for k in bureau_data if k not in allowed}
+    if unexpected:
+        raise ValueError(
+            f"D-09: bureauData has fields without provider attribution: {sorted(unexpected)}"
+        )
 
 
 def _check_score_slot_bounds(rec: AppRecord) -> None:
