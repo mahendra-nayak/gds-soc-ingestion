@@ -28,6 +28,7 @@ from __future__ import annotations
 import ast
 import base64
 import gzip
+import hashlib
 import json
 import logging
 import re
@@ -636,6 +637,16 @@ def merge_sessions(rec: AppRecord, cfg: ClientConfig) -> None:
         _check_payload_debtor_consistency(rec)
 
 
+# INV-02 / D-07: PII pattern set — compiled at module level; used by both
+# _scan_extra_columns_for_pii() and assert_no_raw_pii().
+_PII_PATTERNS: dict[str, re.Pattern] = {
+    "email": re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}"),
+    "phone": re.compile(r"(?:\+?1[\s\-.]?)?\(?\d{3}\)?[\s\-.]?\d{3}[\s\-.]?\d{4}"),
+    "ssn":   re.compile(r"\b\d{3}[\-\s]?\d{2}[\-\s]?\d{4}\b"),
+    "sin":   re.compile(r"\b\d{3}[\-\s]?\d{3}[\-\s]?\d{3}\b"),
+    "fein":  re.compile(r"\b\d{2}[\-]?\d{7}\b"),
+}
+
 # CAN session connector identifiers
 _CAN_SESSION1_CONNECTORS: frozenset[str] = frozenset({"C100810"})
 _CAN_SESSION2_CONNECTORS: frozenset[str] = frozenset({"C161653", "C161796"})
@@ -922,29 +933,93 @@ def apply_transform(value: Any, row: MappingRow, rec: AppRecord, cfg: ClientConf
 # =============================================================================
 # 7. INVARIANT I2 — PII TOKENISATION (before write) + scan
 # =============================================================================
+
+def _sha256_hex(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _tokenise_value(value: str, method: str) -> Any:
+    """Apply a single tokenisation method to a string value."""
+    if method == "pseudonym_reversible":
+        return "TOK_" + _sha256_hex(value)[:16]
+    if method == "oneway_hash":
+        return _sha256_hex(value)
+    if method == "year_only":
+        m = re.search(r"\b(\d{4})\b", value)
+        return m.group(1) if m else value
+    return value
+
+
+def _del_path(obj: dict, dotted: str) -> None:
+    """Remove the leaf key at a dotted path from a nested dict."""
+    parts = dotted.split(".")
+    parent = _get_nested(obj, ".".join(parts[:-1])) if len(parts) > 1 else obj
+    if isinstance(parent, dict):
+        parent.pop(parts[-1], None)
+
+
 def tokenise_pii(rec: AppRecord, cfg: ClientConfig) -> None:
+    """INV-02 / D-07: tokenise all static PII fields before write_record()."""
     for f in cfg.get("pii", {}).get("fields", []) or []:
-        # TODO(team): locate the field in rec.record and replace with token per method:
-        #   pseudonym_reversible -> vault token ; oneway_hash -> hash ;
-        #   scrub_never_store -> remove ; year_only -> truncate DOB.
-        pass
+        path = f.get("path", "")
+        method = f.get("method", "")
+        value = _get_path(rec.record, path)
+        if value is None:
+            continue
+        if method == "scrub_never_store":
+            _del_path(rec.record, path)
+        else:
+            _set_path(rec.record, path, _tokenise_value(str(value), method))
     if cfg["pii"]["extra_columns_scan"]["enabled"]:
         _scan_extra_columns_for_pii(rec, cfg)
 
 
+def _flatten_ec_values(data: Any, prefix: str) -> list:
+    """Return (flat_key, str_value) pairs for all string leaves in nested data."""
+    if isinstance(data, dict):
+        out = []
+        for k, v in data.items():
+            out.extend(_flatten_ec_values(v, f"{prefix}.{k}" if prefix else k))
+        return out
+    if isinstance(data, list):
+        return [item for i, v in enumerate(data)
+                for item in _flatten_ec_values(v, f"{prefix}.{i}")]
+    if isinstance(data, str):
+        return [(prefix, data)]
+    return []
+
+
+def _tokenise_ec_value(rec: AppRecord, key_path: str, val: str) -> None:
+    """If val matches any PII pattern, replace it in rec.extra_columns and record lineage."""
+    for pat_name, pat in _PII_PATTERNS.items():
+        if pat.search(val):
+            token = "TOK_EC_" + _sha256_hex(val)[:16]
+            _set_path(rec.extra_columns, key_path, token)
+            rec.lineage.setdefault("extra_columns_pii_found", []).append(
+                {"key": key_path, "pattern": pat_name}
+            )
+            return
+
+
 def _scan_extra_columns_for_pii(rec: AppRecord, cfg: ClientConfig) -> None:
-    # TODO(team): regex scan every extraColumns value; tokenise matches.
-    pass
+    """INV-02 second enforcement path: scan extra_columns VALUES for PII patterns."""
+    for group_name, group_data in rec.extra_columns.items():
+        for key_path, val in _flatten_ec_values(group_data, group_name):
+            _tokenise_ec_value(rec, key_path, val)
 
 
 def assert_no_raw_pii(rec: AppRecord, cfg: ClientConfig) -> None:
-    """INVARIANT I2 post-write proof. Raises if any raw-PII pattern remains."""
-    patterns = cfg["pii"]["extra_columns_scan"]["patterns"]
+    """INV-02 write gate. Raises RuntimeError if any raw-PII pattern remains in output."""
     blob = json.dumps(rec.record) + json.dumps(rec.extra_columns)
-    # TODO(team): compile real regexes for ssn/fein/ach/email/phone.
-    for _pat in patterns:
-        pass
-    # raise RuntimeError(f"RAW PII detected in {rec.app_id_canonical}") on match
+    for pat_name, pat in _PII_PATTERNS.items():
+        m = pat.search(blob)
+        if m:
+            ctx = blob[max(0, m.start() - 20): m.end() + 20]
+            raise RuntimeError(
+                f"INV-02/D-07 VIOLATION: raw {pat_name} PII in "
+                f"AppID={rec.app_id_canonical}. "
+                f"Context: ...{ctx}..."
+            )
 
 
 # =============================================================================
@@ -1117,7 +1192,12 @@ def run_pipeline(
             merge_sessions(rec, geo_cfg)
             apply_mapping(rec, geo_mapping, geo_cfg)
             tokenise_pii(rec, geo_cfg)                          # I2 — before write
-            assert_no_raw_pii(rec, geo_cfg)                     # I2 — proof
+            try:
+                assert_no_raw_pii(rec, geo_cfg)                 # I2 — write gate
+            except RuntimeError:
+                rec.quarantined = True
+                rec.validation_failures.append("REQ-VAL-007")
+                log.critical("RAW PII DETECTED %s", rec.app_id_canonical)
             build_lineage(rec, geo_cfg, str(zip_path), scrubbed, blobs)
             validate(rec, geo_cfg)                              # I3 — before write
             write_record(rec, geo_cfg)
