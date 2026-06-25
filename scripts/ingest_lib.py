@@ -1058,7 +1058,64 @@ def _no_raw_pii(rec, cfg): return True   # assert_no_raw_pii already ran
 def _creds_scrubbed(rec, cfg):
     return bool(rec.lineage.get("credential_scrubbed_connectors") is not None)
 
-# TODO(team): add REQ-VAL-003/004/006 and REQ-BL-001..N as the clients require.
+@rule("REQ-VAL-003")
+def _can_two_sessions(rec, cfg):
+    if rec.geography != "CAN":
+        return True
+    bureau_indicated = (rec.lineage.get("can_session_1_connectors") or
+                        rec.lineage.get("can_session_2_connectors"))
+    if not bureau_indicated:
+        return True   # FF product — not subject
+    return not rec.lineage.get("multi_session_incomplete", False)
+
+
+@rule("REQ-VAL-004")
+def _has_bureau(rec, cfg):
+    has = any(sf.connector in ("C100810", "C161796", "C1677939") for sf in rec.files)
+    if not has:
+        rec.lineage["has_bureau_data"] = False
+    return True   # soft-warn only — always passes validation, records lineage flag
+
+
+@rule("REQ-VAL-006")
+def _decision_present(rec, cfg):
+    decision = rec.record.get("system", {}).get("application", {}).get("decision")
+    return decision is not None or rec.lineage.get("decision_missing", False)
+
+
+@rule("REQ-BL-001")
+def _bl_reason_codes(rec, cfg):
+    return not rec.lineage.get("reason_codes_missing", False)
+
+
+@rule("REQ-BL-002")
+def _bl_session_order(rec, cfg):
+    return not rec.lineage.get("session_order_anomaly", False)
+
+
+@rule("REQ-BL-003")
+def _bl_debtor_consistency(rec, cfg):
+    return not any(f.startswith("D-02-") for f in rec.validation_failures)
+
+
+@rule("REQ-BL-004")
+def _bl_pygdsa_attrs(rec, cfg):
+    attr_count = len(rec.extra_columns.get("SOC_pygdsa_attributes", {}))
+    if 0 < attr_count < 100:
+        rec.lineage["pygdsa_parse_partial"] = True
+        return False
+    return True
+
+
+@rule("REQ-BL-005")
+def _bl_product_info(rec, cfg):
+    prod_info = (rec.record.get("system", {})
+                 .get("application", {})
+                 .get("productInformation", []))
+    if not prod_info:
+        rec.lineage["product_info_incomplete"] = True
+        return False
+    return True
 
 
 def validate(rec: AppRecord, cfg: ClientConfig) -> None:
@@ -1101,12 +1158,26 @@ def build_lineage(rec: AppRecord, cfg: ClientConfig, source_zip: str,
     rec.record.setdefault("system", {})["lineage"] = rec.lineage
 
 
-def write_record(rec: AppRecord, cfg: ClientConfig) -> None:
+def write_record(rec: AppRecord, cfg: ClientConfig,
+                 workdir: "str | Path | None" = None) -> None:
     if rec.quarantined:
+        if workdir is not None:
+            quarantine_record = {
+                "app_id_canonical": rec.app_id_canonical,
+                "app_id_raw":       rec.app_id_raw,
+                "geography":        rec.geography,
+                "quarantine_reason": rec.validation_failures,
+                "lineage":          rec.lineage,
+                "record_partial":   rec.record,
+            }
+            path = Path(workdir) / "quarantine" / f"{rec.app_id_canonical}.json"
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(json.dumps(quarantine_record, indent=2))
         log.error("QUARANTINE %s -> %s", rec.app_id_canonical, rec.validation_failures)
-        return                                          # blocked from DataLake=Y
+        return                                          # INV-09: blocked from DataLake=Y
+    assert not rec.quarantined                         # INV-09: DataLake=Y unreachable for quarantined
     # TODO(team): real DataLake write (partitioned by client/geography/date).
-    log.info("WRITE %s (%s)", rec.app_id_canonical, rec.lineage["validation_status"])
+    log.info("WRITE %s (%s)", rec.app_id_canonical, rec.lineage.get("validation_status"))
 
 
 # =============================================================================
@@ -1160,6 +1231,7 @@ def run_pipeline(
     geo_files = dispatch_by_geo(files)          # INV-10: dispatch BEFORE scrub
 
     out: list[AppRecord] = []
+    quarantined: list[AppRecord] = []
     for geo, geo_file_set in geo_files.items():
         if not geo_file_set:
             continue
@@ -1200,10 +1272,35 @@ def run_pipeline(
                 log.critical("RAW PII DETECTED %s", rec.app_id_canonical)
             build_lineage(rec, geo_cfg, str(zip_path), scrubbed, blobs)
             validate(rec, geo_cfg)                              # I3 — before write
-            write_record(rec, geo_cfg)
+            write_record(rec, geo_cfg, workdir)
             out.append(rec)
+            if rec.quarantined:
+                quarantined.append(rec)
 
+    _write_quarantine_report(out, quarantined, zip_path, workdir)
     return out
+
+
+def _write_quarantine_report(
+    out: list[AppRecord],
+    quarantined: list[AppRecord],
+    zip_path: "str | Path",
+    workdir: "str | Path",
+) -> None:
+    from collections import Counter
+    reason_freq = dict(Counter(f for r in quarantined for f in r.validation_failures))
+    report = {
+        "run_timestamp":       datetime.now(timezone.utc).isoformat(),
+        "source_zip":          str(zip_path),
+        "total_records":       len(out),
+        "total_quarantined":   len(quarantined),
+        "quarantine_rate_pct": round(100 * len(quarantined) / max(len(out), 1), 1),
+        "reason_frequency":    reason_freq,
+        "quarantined_app_ids": [r.app_id_canonical for r in quarantined],
+    }
+    report_path = Path(workdir) / "quarantine" / "report.json"
+    report_path.parent.mkdir(exist_ok=True)
+    report_path.write_text(json.dumps(report, indent=2))
 
 
 # --- small shared helpers ----------------------------------------------------

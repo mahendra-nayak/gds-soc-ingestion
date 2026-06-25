@@ -95,8 +95,16 @@ validation:
   hard_quarantine_rules:
     - REQ-VAL-001
     - REQ-VAL-002
+    - REQ-VAL-003
     - REQ-VAL-005
     - REQ-VAL-007
     - REQ-VAL-008
-  soft_warn_rules: []
+  soft_warn_rules:
+    - REQ-VAL-004
+    - REQ-VAL-006
+    - REQ-BL-001
+    - REQ-BL-002
+    - REQ-BL-003
+    - REQ-BL-004
+    - REQ-BL-005
   client_params: {}
