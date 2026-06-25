@@ -1,1 +1,88 @@
-# FILL IN TASK-3/5
+# client_config.SOC_USA.yaml
+# Structural scaffold — connector registry populated by CC (T5.1).
+# Sections marked <FILL:...> require engineer input before pipeline runs end-to-end.
+
+client:
+  code: <FILL:client_code>           # e.g. SOC_USA
+  schema_version: <FILL:schema_version>  # e.g. 1.1
+  config_version: <FILL:config_version>
+
+package:
+  folder_priority:
+    - name: data
+    - name: raw
+    - name: audit
+
+application_id:
+  source: filename_tokens
+  filename:
+    pattern: <FILL:filename_regex>
+    canonical_app_id_groups: <FILL:group_names>
+  suffix_rules:
+    - suffix: _test
+      action: strip
+      flag_lineage: true
+
+sessions:
+  model: single
+
+connectors:
+  # ── Non-credential connectors ─────────────────────────────────────────────
+  - code: C225334
+    is_credential: false
+    parse_strategy: raw_json
+
+  - code: C78098
+    is_credential: false
+    parse_strategy: gds_envelope_json
+
+  - code: C78449
+    is_credential: false
+    parse_strategy: gds_envelope_json
+
+  - code: C103403
+    is_credential: false
+    parse_strategy: pygdsa_json
+
+  - code: C1677939
+    is_credential: false
+    parse_strategy: xml_dict
+
+  - code: C215125
+    is_credential: false
+    parse_strategy: gds_envelope_json
+
+  - code: C238743
+    is_credential: false
+    parse_strategy: gds_envelope_json
+
+  - code: C224847
+    is_credential: false
+    parse_strategy: gds_envelope_json
+
+  # ── Credential connectors (is_credential: true — never parsed) ────────────
+  - code: C754889
+    is_credential: true
+    parse_strategy: credential_discard
+
+preprocess:
+  credential_scrub: <FILL:scrub_rules>   # list of {connector, method, ...} rules
+  external_ref:
+    size_threshold_kb: <FILL:threshold_kb>
+    object_store_uri_pattern: <FILL:uri_pattern>
+
+pii:
+  fields: <FILL:pii_fields>             # list of {path, method} PII field descriptors
+  extra_columns_scan:
+    enabled: false
+    patterns: []
+
+validation:
+  hard_quarantine_rules:
+    - REQ-VAL-001
+    - REQ-VAL-002
+    - REQ-VAL-005
+    - REQ-VAL-007
+    - REQ-VAL-008
+  soft_warn_rules: []
+  client_params: {}
