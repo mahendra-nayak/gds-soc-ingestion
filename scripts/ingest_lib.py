@@ -470,6 +470,24 @@ def _parse_cred(sf: SourceFile, cfg: ClientConfig) -> Any:
     return None
 
 
+@strategy("pygdsa_json")
+def _parse_pygdsa(sf: SourceFile, cfg: ClientConfig) -> Any:
+    """C103403 double-parse: HTTP strip → gunzip → JSON → base64-decode each segment → flat attrs."""
+    if sf.raw_bytes is None:
+        sf.raw_bytes = sf.path.read_bytes()
+    # INV-01: credential must be scrubbed before this parse executes
+    assert not re.search(
+        r"(?i)Authorization:\s*Bearer\s+\S+",
+        sf.raw_bytes.decode("utf-8", errors="replace"),
+    ), "INV-01: C103403 credential not scrubbed before double-parse"
+    body = maybe_gunzip(http_envelope_strip(sf.raw_bytes))
+    outer_json = json.loads(body)
+    attrs: dict = {}
+    for seg in outer_json:
+        attrs.update(json.loads(base64.b64decode(seg, validate=True)))
+    return attrs
+
+
 def _strip_ns(obj: Any) -> Any:
     # TODO(production-hardening): add max_depth parameter to _strip_ns() to
     # prevent stack overflow on pathologically nested XML. Real GDS payloads
@@ -708,7 +726,8 @@ def _extract_ecs_debtor(sf: SourceFile) -> str | None:
     if sf.connector == "C225334" and sf.direction == "REQ":
         return sf.payload.get("record", {}).get("EcsDebtorNumber")
     if sf.connector == "C103403" and sf.direction == "RESP":
-        return sf.payload.get("attributes", {}).get("EcsDebtorNumber")
+        # pygdsa_json yields a flat attrs dict; EcsDebtorNumber is a top-level key
+        return sf.payload.get("EcsDebtorNumber")
     if sf.folder == "data":
         return sf.payload.get("data", {}).get("EcsDebtorNumber")
     return None
@@ -933,6 +952,16 @@ def _handle_fff_quarantine(sf: SourceFile, rec: AppRecord) -> None:
     rec.quarantined = True
 
 
+def _check_pygdsa_attr_count(sf: SourceFile, rec: AppRecord) -> None:
+    """REQ-BL-004: soft-warn when C103403 attr_count < 100. Not a quarantine."""
+    if sf.payload is None:
+        return
+    attr_count = len(sf.payload)
+    if attr_count < 100:
+        log.warning("REQ-BL-004: C103403 attr_count=%d < 100", attr_count)
+        rec.validation_failures.append("REQ-BL-004")
+
+
 def run_pipeline(
     zip_path: str | Path,
     config_path: str | Path,
@@ -991,6 +1020,8 @@ def run_pipeline(
                 conn = _connector_cfg(sf.connector, geo_cfg)
                 if conn and conn.get("parse_strategy") == "fff":
                     _handle_fff_quarantine(sf, rec)
+                elif conn and conn.get("parse_strategy") == "pygdsa_json":
+                    _check_pygdsa_attr_count(sf, rec)
             merge_sessions(rec, geo_cfg)
             apply_mapping(rec, geo_mapping, geo_cfg)
             tokenise_pii(rec, geo_cfg)                          # I2 — before write

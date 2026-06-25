@@ -53,14 +53,14 @@ def _make_rec(*files: SourceFile) -> AppRecord:
 class TestSameDebtorAllSessions:
     def test_same_debtor_not_quarantined(self):
         sf1 = _make_sf("C225334", "REQ", payload={"record": {"EcsDebtorNumber": "500249966"}})
-        sf2 = _make_sf("C103403", "RESP", payload={"attributes": {"EcsDebtorNumber": "500249966"}})
+        sf2 = _make_sf("C103403", "RESP", payload={"EcsDebtorNumber": "500249966"})
         rec = _make_rec(sf1, sf2)
         _check_payload_debtor_consistency(rec)
         assert rec.quarantined is False
 
     def test_no_d02_failure_same_debtor(self):
         sf1 = _make_sf("C225334", "REQ", payload={"record": {"EcsDebtorNumber": "500249966"}})
-        sf2 = _make_sf("C103403", "RESP", payload={"attributes": {"EcsDebtorNumber": "500249966"}})
+        sf2 = _make_sf("C103403", "RESP", payload={"EcsDebtorNumber": "500249966"})
         rec = _make_rec(sf1, sf2)
         _check_payload_debtor_consistency(rec)
         assert "D-02-payload-debtor-mismatch" not in rec.validation_failures
@@ -72,21 +72,21 @@ class TestSameDebtorAllSessions:
 class TestDifferentDebtors:
     def test_quarantined_on_mismatch(self):
         sf1 = _make_sf("C225334", "REQ", payload={"record": {"EcsDebtorNumber": "500249966"}})
-        sf2 = _make_sf("C103403", "RESP", payload={"attributes": {"EcsDebtorNumber": "999999999"}})
+        sf2 = _make_sf("C103403", "RESP", payload={"EcsDebtorNumber": "999999999"})
         rec = _make_rec(sf1, sf2)
         _check_payload_debtor_consistency(rec)
         assert rec.quarantined is True
 
     def test_d02_failure_recorded(self):
         sf1 = _make_sf("C225334", "REQ", payload={"record": {"EcsDebtorNumber": "AAA"}})
-        sf2 = _make_sf("C103403", "RESP", payload={"attributes": {"EcsDebtorNumber": "BBB"}})
+        sf2 = _make_sf("C103403", "RESP", payload={"EcsDebtorNumber": "BBB"})
         rec = _make_rec(sf1, sf2)
         _check_payload_debtor_consistency(rec)
         assert "D-02-payload-debtor-mismatch" in rec.validation_failures
 
     def test_three_sessions_mismatch(self):
         sf1 = _make_sf("C225334", "REQ", payload={"record": {"EcsDebtorNumber": "111"}})
-        sf2 = _make_sf("C103403", "RESP", payload={"attributes": {"EcsDebtorNumber": "222"}})
+        sf2 = _make_sf("C103403", "RESP", payload={"EcsDebtorNumber": "222"})
         sf3 = _make_sf("C225334", "REQ", payload={"record": {"EcsDebtorNumber": "111"}}, folder="raw")
         rec = _make_rec(sf1, sf2, sf3)
         _check_payload_debtor_consistency(rec)
@@ -139,8 +139,9 @@ class TestC225334Extraction:
 # TC-5: C103403-RESP payload extraction
 # ---------------------------------------------------------------------------
 class TestC103403Extraction:
-    def test_extracts_from_attributes_path(self):
-        sf = _make_sf("C103403", "RESP", payload={"attributes": {"EcsDebtorNumber": "600249966"}})
+    def test_extracts_from_flat_attrs_dict(self):
+        # pygdsa_json yields a flat attrs dict; EcsDebtorNumber is a top-level key
+        sf = _make_sf("C103403", "RESP", payload={"EcsDebtorNumber": "600249966"})
         result = _extract_ecs_debtor(sf)
         assert result == "600249966"
 
