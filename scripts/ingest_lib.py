@@ -469,6 +469,9 @@ def _parse_cred(sf: SourceFile, cfg: ClientConfig) -> Any:
 
 
 def _strip_ns(obj: Any) -> Any:
+    # TODO(production-hardening): add max_depth parameter to _strip_ns() to
+    # prevent stack overflow on pathologically nested XML. Real GDS payloads
+    # are shallow; this is a production safety net only.
     if isinstance(obj, dict):
         return {k.split(":")[-1]: _strip_ns(v) for k, v in obj.items()}
     if isinstance(obj, list):

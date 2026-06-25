@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ns2:CreditBureau xmlns:ns2="http://transunion.com/schema/creditbureau/v2"
+                  xmlns:bs="http://transunion.com/schema/base/v1"
+                  xmlns:cs="http://transunion.com/schema/common/v1">
+  <ns2:Header>
+    <bs:RequestId>REQ-001</bs:RequestId>
+    <bs:ReportDate>2025-01-01</bs:ReportDate>
+  </ns2:Header>
+  <ns2:Subject>
+    <ns2:Name>
+      <cs:First>REDACTED</cs:First>
+      <cs:Last>REDACTED</cs:Last>
+    </ns2:Name>
+    <ns2:Score>
+      <cs:Value>720</cs:Value>
+      <cs:Model>FICO8</cs:Model>
+    </ns2:Score>
+  </ns2:Subject>
+  <ns2:TradeLines>
+    <ns2:TradeLine>
+      <bs:AccountType>CC</bs:AccountType>
+      <bs:Balance>0</bs:Balance>
+    </ns2:TradeLine>
+  </ns2:TradeLines>
+</ns2:CreditBureau>
