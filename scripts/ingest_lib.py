@@ -450,9 +450,11 @@ def _parse_soap(sf: SourceFile, cfg: ClientConfig) -> Any:
 
 @strategy("fff")
 def _parse_fff(sf: SourceFile, cfg: ClientConfig) -> Any:
-    # Fixed-form-format bureau payload (SOC Experian C161652).
-    # TODO(team): width spec per record type from the SDD / bureau layout.
-    raise NotImplementedError("FFF layout spec required from team")
+    # TODO(Q-FFF): implement when FFF width specification delivered by SOC client.
+    raise NotImplementedError(
+        f"FFF parse not implemented — connector {sf.connector}. "
+        "Awaiting FFF layout spec from SOC client (Q-FFF)."
+    )
 
 
 @strategy("binary_external_ref")
@@ -924,11 +926,11 @@ def write_record(rec: AppRecord, cfg: ClientConfig) -> None:
 # =============================================================================
 # 10. ORCHESTRATION — fixed order; invariants cannot be reordered
 # =============================================================================
-def _handle_fff_quarantine(sf: SourceFile, cfg: ClientConfig) -> None:
-    # TODO(Q-FFF): FFF parse failure quarantine handling pending Q-FFF resolution.
-    log.warning(
-        "FFF quarantine pending Q-FFF: file=%s connector=%s", sf.path.name, sf.connector
-    )
+def _handle_fff_quarantine(sf: SourceFile, rec: AppRecord) -> None:
+    sf.payload = None
+    rec.lineage["fff_parse_blocked"] = True
+    rec.validation_failures.append("fff_parse_blocked")
+    rec.quarantined = True
 
 
 def run_pipeline(
@@ -979,12 +981,16 @@ def run_pipeline(
                 parse_file(sf, geo_cfg)
             except NotImplementedError as e:
                 log.warning("parse pending %s: %s", sf.connector, e)
-                _handle_fff_quarantine(sf, geo_cfg)            # TODO(Q-FFF)
 
         apps = group_by_app(geo_file_set, geo_cfg)
         blobs: list[dict] = []
         for rec in apps.values():
             rec.geography = geo
+            # INV-13: fff parse failure = hard quarantine; silent skip is not permitted
+            for sf in rec.files:
+                conn = _connector_cfg(sf.connector, geo_cfg)
+                if conn and conn.get("parse_strategy") == "fff":
+                    _handle_fff_quarantine(sf, rec)
             merge_sessions(rec, geo_cfg)
             apply_mapping(rec, geo_mapping, geo_cfg)
             tokenise_pii(rec, geo_cfg)                          # I2 — before write
