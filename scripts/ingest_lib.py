@@ -794,6 +794,7 @@ def apply_mapping(rec: AppRecord, mapping: list[MappingRow], cfg: ClientConfig) 
             continue
         value = apply_transform(value, row, rec, cfg)
         _set_path(rec.record, row.sdd_path, value)
+    _check_score_slot_bounds(rec)
     _check_decline_completeness(rec)
 
 
@@ -847,9 +848,17 @@ def resolve_source(rec: AppRecord, row: MappingRow, cfg: ClientConfig) -> Any:
 
 
 def _read_locator(rec: AppRecord, src: dict, cfg: ClientConfig) -> Any:
-    # locator like "C4871 web_service | data/ | REQ"; path like "data.Request.contract_id"
-    # TODO(team): match connector+folder+direction to the right SourceFile.payload,
-    # then dotted-path lookup. Returns None if not present (graceful nulls).
+    locator = src.get("locator", "")
+    field_path = src.get("path", "")
+    parts = [p.strip() for p in locator.split("|")]
+    if len(parts) < 3:
+        return None
+    connector_code, folder, direction = parts[0], parts[1], parts[2]
+    for sf in rec.files:
+        if sf.connector == connector_code and sf.folder == folder and sf.direction == direction:
+            if sf.payload is None:
+                return None
+            return _get_nested(sf.payload, field_path)
     return None
 
 
