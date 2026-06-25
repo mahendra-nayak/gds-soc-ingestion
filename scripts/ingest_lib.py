@@ -773,7 +773,7 @@ def load_mapping_sheet(xlsx_path: str | Path) -> list[MappingRow]:
     wb = load_workbook(xlsx_path, read_only=True, data_only=True)
     ws = wb["Field Mapping"]
     rows = list(ws.iter_rows(values_only=True))
-    header = {str(h).strip(): i for i, h in enumerate(rows[0]) if h}
+    header = _build_header_index(rows[0])
     out: list[MappingRow] = []
     for r in rows[1:]:
         sdd = r[header.get("SDD Field Path", 1)]
@@ -783,6 +783,36 @@ def load_mapping_sheet(xlsx_path: str | Path) -> list[MappingRow]:
     return out
 
 
+def _build_header_index(header_row) -> dict[str, int]:
+    """Build column-name → index dict, indexing by both full and first-line key.
+
+    Columns like 'PII\\n(P/H/D-N/❌)' are reachable via cell("PII") because
+    the first-line prefix is also indexed (shorter key wins on conflict).
+    """
+    idx: dict[str, int] = {}
+    for i, h in enumerate(header_row):
+        if not h:
+            continue
+        full = str(h).strip()
+        idx[full] = i
+        first = full.split("\n")[0].strip()
+        if first != full and first not in idx:
+            idx[first] = i
+    return idx
+
+
+def _clean_field_path(raw: str) -> str:
+    """Strip analyst annotations from a mapping path cell value.
+
+    Handles two patterns seen in field_mapping.xlsx:
+      - Semicolon-separated alternatives: take first.
+      - Trailing parenthetical note '(...)': strip it.
+    """
+    path = raw.split(";")[0].strip()
+    path = re.sub(r"\s*\([^)]*\)\s*$", "", path).strip()
+    return path
+
+
 def _row_from_cells(r, header) -> MappingRow:
     def cell(name, default=None):
         i = header.get(name)
@@ -790,14 +820,20 @@ def _row_from_cells(r, header) -> MappingRow:
     sources = []
     for tier in ("PRIMARY", "SECONDARY", "TERTIARY"):
         conn = cell(f"{tier}\nConnector | Folder | Direction") or cell(f"{tier} Connector | Folder | Direction")
-        path = cell(f"{tier} Path") or cell(f"PRIMARY Path\n[Obj-1 / Current / First Score]") if tier == "PRIMARY" else cell(f"{tier} Path")
+        if tier == "PRIMARY":
+            path = (cell("PRIMARY Path\n[Obj-1 / Current / 1st]") or
+                    cell("PRIMARY Path\n[Obj-1 / Current / First Score]") or
+                    cell("PRIMARY Path"))
+        else:
+            path = cell(f"{tier} Path")
         if conn:
             sources.append({"tier": tier, "locator": str(conn), "path": str(path or "")})
+    pii_val = cell("PII")
     return MappingRow(
         sdd_path=str(cell("SDD Field Path")).strip(),
         category=str(cell("Category") or ""),
         data_type=str(cell("Data Type") or ""),
-        pii=bool(cell("PII")),
+        pii=pii_val in ("P", "H"),
         sources=sources,
         transform=cell("Transform"),
         construction=cell("Mapping Notes / Construction Logic / Open Questions"),
@@ -898,11 +934,13 @@ def resolve_source(rec: AppRecord, row: MappingRow, cfg: ClientConfig) -> Any:
 
 def _read_locator(rec: AppRecord, src: dict, cfg: ClientConfig) -> Any:
     locator = src.get("locator", "")
-    field_path = src.get("path", "")
+    field_path = _clean_field_path(src.get("path", ""))
     parts = [p.strip() for p in locator.split("|")]
     if len(parts) < 3:
         return None
-    connector_code, folder, direction = parts[0], parts[1], parts[2]
+    connector_code = parts[0]
+    folder = parts[1].rstrip("/")        # normalise: "data/" → "data"
+    direction = parts[2]
     for sf in rec.files:
         if sf.connector == connector_code and sf.folder == folder and sf.direction == direction:
             if sf.payload is None:
@@ -1337,7 +1375,17 @@ def _set_path(obj: dict, dotted: str, value: Any) -> None:
 
 
 def _step_nested(cur: Any, part: str) -> Any:
-    """Single dotted-path step: dict key lookup or list index (numeric part)."""
+    """Single dotted-path step: dict key lookup or list index (numeric part).
+
+    'field[]' notation (from XLSX paths like 'data[].name') means: get 'field'
+    from the dict then take the first element of the resulting list.
+    """
+    if part.endswith("[]"):
+        key = part[:-2]
+        val = cur.get(key) if isinstance(cur, dict) else None
+        if isinstance(val, list):
+            return val[0] if val else None
+        return val
     if isinstance(cur, list):
         try:
             return cur[int(part)]
