@@ -82,6 +82,20 @@ pii:
     enabled: false
     patterns: []
 
+extra_columns_groups:
+  - name: SOC_pygdsa_attributes
+    connector: C103403
+    description: Flat attribute dict from pygdsa_json double-parse
+  - name: SOC_derived_application
+    connector: C225334
+    description: Parsed DerivedApplicationRecord[0].Payload (json_double_parse)
+  - name: SOC_decision_variable
+    connector: C225334
+    description: Parsed DecisionVariableRecord[0].Payload (json_double_parse)
+  - name: SOC_decision_req
+    connector: C238743
+    description: Parsed data.Decision sub-fields from REQ (ast_literal_eval)
+
 validation:
   hard_quarantine_rules:
     - REQ-VAL-001

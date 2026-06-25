@@ -801,7 +801,10 @@ def apply_mapping(rec: AppRecord, mapping: list[MappingRow], cfg: ClientConfig) 
         if value is None:
             continue
         value = apply_transform(value, row, rec, cfg)
-        _set_path(rec.record, row.sdd_path, value)
+        if row.sdd_path.startswith("extra_columns."):
+            _set_path(rec.extra_columns, row.sdd_path[len("extra_columns."):], value)
+        else:
+            _set_path(rec.record, row.sdd_path, value)
     _check_score_slot_bounds(rec)
     _check_decline_completeness(rec)
     _set_bureau_provider_lineage(rec)
@@ -1156,13 +1159,23 @@ def _set_path(obj: dict, dotted: str, value: Any) -> None:
     cur[parts[-1]] = value
 
 
+def _step_nested(cur: Any, part: str) -> Any:
+    """Single dotted-path step: dict key lookup or list index (numeric part)."""
+    if isinstance(cur, list):
+        try:
+            return cur[int(part)]
+        except (ValueError, IndexError):
+            return None
+    if isinstance(cur, dict):
+        return cur.get(part)
+    return None
+
+
 def _get_nested(obj: Any, dotted: str) -> Any:
     """Dotted-path read into a parsed payload dict. Returns None on any miss."""
     cur = obj
     for part in dotted.split("."):
-        if not isinstance(cur, dict):
-            return None
-        cur = cur.get(part)
+        cur = _step_nested(cur, part)
         if cur is None:
             return None
     return cur
