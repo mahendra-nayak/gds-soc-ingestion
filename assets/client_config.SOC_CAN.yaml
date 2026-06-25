@@ -1,1 +1,5 @@
 # FILL IN TASK-3/6
+connectors:
+  - code: C161653
+    is_credential: true
+    parse_strategy: credential_discard
