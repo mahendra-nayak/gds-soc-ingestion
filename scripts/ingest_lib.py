@@ -25,6 +25,7 @@ bodies and the vault/object-store/DataLake adapters are marked `TODO(team)`.
 """
 from __future__ import annotations
 
+import ast
 import base64
 import gzip
 import json
@@ -905,6 +906,10 @@ def apply_transform(value: Any, row: MappingRow, rec: AppRecord, cfg: ClientConf
     if "split" in t:
         delim = "|"                                     # configurable per row
         return [s.strip() for s in str(value).split(delim) if s.strip()]
+    if "json_double_parse" in t:
+        return json.loads(value)
+    if "ast_literal_eval" in t:
+        return ast.literal_eval(value)
     # EAV, score-array construction, per-applicant indicator filtering,
     # one-object->multi-entry expansion (TIB) are construction-logic transforms.
     # TODO(team): dispatch on row.construction for those.
