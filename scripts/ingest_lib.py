@@ -175,6 +175,14 @@ def _classify_file(p: Path, folder: str, cfg: ClientConfig) -> SourceFile:
 
     # direction — normalise to REQ | RESP | None
     sf.direction = _DIRECTION_MAP.get((gd.get("direction") or "").lower())
+    if sf.direction is None:
+        # Fallback: derive from filename when regex has no direction group.
+        # Check 'response' first — it doesn't contain 'request' as a substring.
+        stem = p.stem.lower()
+        if "response" in stem:
+            sf.direction = "RESP"
+        elif "request" in stem:
+            sf.direction = "REQ"
 
     # sequence_id — str, never cast to int (IC-3)
     sf.sequence_id = gd.get("sequence_id") or None
@@ -1420,9 +1428,19 @@ def _write_quarantine_report(
 
 # --- small shared helpers ----------------------------------------------------
 def _to_utc_iso(value: Any) -> str | None:
+    s = str(value).strip()
+    # Normalise +HHMM (no colon) → +HH:MM so fromisoformat handles it uniformly
+    s_norm = re.sub(r"([+-])(\d{2})(\d{2})$", r"\1\2:\3", s)
+    try:
+        dt = datetime.fromisoformat(s_norm)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc).isoformat()
+        return dt.astimezone(timezone.utc).isoformat()
+    except (ValueError, TypeError):
+        pass
     for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%Y%m%d%H%M%S", "%Y-%m-%dT%H:%M:%S"):
         try:
-            return datetime.strptime(str(value), fmt).replace(tzinfo=timezone.utc).isoformat()
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc).isoformat()
         except ValueError:
             continue
     return None
