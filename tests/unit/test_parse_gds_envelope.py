@@ -119,11 +119,12 @@ class TestMalformedJson:
         with pytest.raises(json.JSONDecodeError):
             parse_file(sf, _cfg())
 
-    def test_empty_file_raises_decode_error(self, tmp_path):
+    def test_empty_file_raises_not_implemented(self, tmp_path):
+        # Empty file is non-JSON — treated as FFF/unrecognised format (Q-FFF gate)
         f = tmp_path / "empty.json"
         f.write_text("", encoding="utf-8")
         sf = _make_sf(f, connector="C78098")
-        with pytest.raises(json.JSONDecodeError):
+        with pytest.raises(NotImplementedError):
             parse_file(sf, _cfg())
 
     def test_truncated_json_raises_decode_error(self, tmp_path):

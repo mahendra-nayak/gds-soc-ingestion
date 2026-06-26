@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import binascii
 import gzip
 import hashlib
 import json
@@ -40,6 +41,7 @@ from typing import Any, Callable, Iterable
 
 log = logging.getLogger("dg_forge.ingest")
 
+_ENGINE_VERSION = "1.0.0"
 
 # =============================================================================
 # 0. Config + record containers
@@ -207,7 +209,8 @@ def scrub_credentials(files: list[SourceFile], cfg: ClientConfig) -> list[str]:
     where the secret is in the wire header, and on parsed structures otherwise.
     """
     scrubbed: list[str] = []
-    rules = cfg.get("preprocess", {}).get("credential_scrub", []) or []
+    _raw = cfg.get("preprocess", {}).get("credential_scrub", [])
+    rules: list[dict] = _raw if isinstance(_raw, list) else []
     by_connector: dict[str, list[dict]] = {}
     for r in rules:
         by_connector.setdefault(r["connector"], []).append(r)
@@ -318,9 +321,11 @@ def _scrub_json_body(sf: SourceFile, rule: dict) -> None:
 # 3. PRE-PROCESS — strip / decompress / decode / multiparse / externalise
 # =============================================================================
 def http_envelope_strip(raw: bytes) -> bytes:
-    """raw/ wire payloads carry HTTP headers; body starts after CRLFCRLF."""
-    sep = b"\r\n\r\n"
-    return raw.split(sep, 1)[1] if sep in raw else raw
+    """raw/ wire payloads carry HTTP headers; body starts after CRLFCRLF or LFLF."""
+    for sep in (b"\r\n\r\n", b"\n\n"):
+        if sep in raw:
+            return raw.split(sep, 1)[1]
+    return raw
 
 
 def maybe_gunzip(body: bytes) -> bytes:
@@ -425,13 +430,25 @@ def parse_file(sf: SourceFile, cfg: ClientConfig) -> Any:
 @strategy("gds_envelope_json")
 def _parse_gds_envelope(sf: SourceFile, cfg: ClientConfig) -> Any:
     """data/ tier: full GDS envelope; real payload under data{}."""
-    obj = json.loads(sf.path.read_text(encoding="utf-8"))
+    text = sf.path.read_text(encoding="utf-8")
+    stripped = text.lstrip()
+    if not stripped.startswith(("{", "[")):
+        # Non-JSON content (FFF format) — connector delivers both JSON and FFF
+        # files; FFF path is pending Q-FFF resolution. TODO(Q-FFF).
+        raise NotImplementedError(
+            f"Non-JSON (FFF) format in gds_envelope_json file {sf.path.name} — "
+            f"connector {sf.connector}. TODO(Q-FFF)."
+        )
+    obj = json.loads(stripped)
     return obj.get("data", obj)
 
 
 @strategy("raw_json")
 def _parse_raw_json(sf: SourceFile, cfg: ClientConfig) -> Any:
     body = maybe_gunzip(http_envelope_strip(sf.path.read_bytes()))
+    if not body.strip():
+        log.warning("raw_json: empty body for %s — no payload extracted", sf.path.name)
+        return None
     return json.loads(body)
 
 
@@ -474,7 +491,12 @@ def _parse_cred(sf: SourceFile, cfg: ClientConfig) -> Any:
 
 @strategy("pygdsa_json")
 def _parse_pygdsa(sf: SourceFile, cfg: ClientConfig) -> Any:
-    """C103403 double-parse: HTTP strip → gunzip → JSON → base64-decode each segment → flat attrs."""
+    """C103403 parse: HTTP strip → [gunzip →] JSON → extract pygdsa attributes.
+
+    Handles two outer-JSON shapes:
+      dict  — {"response": {"attributes": {...}}} (actual sample format)
+      list  — [base64seg, ...] (originally assumed format; kept as fallback)
+    """
     if sf.raw_bytes is None:
         sf.raw_bytes = sf.path.read_bytes()
     # INV-01: credential must be scrubbed before this parse executes
@@ -485,8 +507,15 @@ def _parse_pygdsa(sf: SourceFile, cfg: ClientConfig) -> Any:
     body = maybe_gunzip(http_envelope_strip(sf.raw_bytes))
     outer_json = json.loads(body)
     attrs: dict = {}
-    for seg in outer_json:
-        attrs.update(json.loads(base64.b64decode(seg, validate=True)))
+    if isinstance(outer_json, dict):
+        # Actual format: {"response": {"attributes": {...}}}
+        attrs = outer_json.get("response", {}).get("attributes", {}) or {}
+    elif isinstance(outer_json, list):
+        for seg in outer_json:
+            try:
+                attrs.update(json.loads(base64.b64decode(seg, validate=True)))
+            except (binascii.Error, json.JSONDecodeError, ValueError):
+                log.warning("pygdsa: malformed segment skipped for %s", sf.connector)
     return attrs
 
 
@@ -998,7 +1027,8 @@ def _del_path(obj: dict, dotted: str) -> None:
 
 def tokenise_pii(rec: AppRecord, cfg: ClientConfig) -> None:
     """INV-02 / D-07: tokenise all static PII fields before write_record()."""
-    for f in cfg.get("pii", {}).get("fields", []) or []:
+    _raw_fields = cfg.get("pii", {}).get("fields", [])
+    for f in (_raw_fields if isinstance(_raw_fields, list) else []):
         path = f.get("path", "")
         method = f.get("method", "")
         value = _get_path(rec.record, path)
@@ -1079,7 +1109,9 @@ def _appid_present(rec, cfg): return bool(rec.app_id_canonical)
 
 @rule("REQ-VAL-002")
 def _geo_valid(rec, cfg):
-    valids = cfg["validation"]["client_params"]["valid_geographies"]
+    valids = cfg.get("validation", {}).get("client_params", {}).get("valid_geographies")
+    if not valids:
+        return True  # not configured — pass through
     return rec.geography in valids if rec.geography else True
 
 @rule("REQ-VAL-005")
@@ -1179,6 +1211,7 @@ def validate(rec: AppRecord, cfg: ClientConfig) -> None:
 # =============================================================================
 def build_lineage(rec: AppRecord, cfg: ClientConfig, source_zip: str,
                   scrubbed: list[str], blobs: list[dict]) -> None:
+    ec_count = sum(len(list(_flatten_ec_values(v, ""))) for v in rec.extra_columns.values())
     rec.lineage.update({
         "source_zip": source_zip,
         "app_id_raw": rec.app_id_raw,
@@ -1192,8 +1225,30 @@ def build_lineage(rec: AppRecord, cfg: ClientConfig, source_zip: str,
         "credential_scrubbed_connectors": scrubbed,
         "base64_blobs_extracted": blobs,
         "has_connector_data": any(sf.connector for sf in rec.files),
+        "engine_version": _ENGINE_VERSION,
+        "extra_columns_field_count": ec_count,
     })
     rec.record.setdefault("system", {})["lineage"] = rec.lineage
+
+
+def _check_d13_completeness(rec: AppRecord) -> None:
+    """D-13: quarantine the record if any of the four completeness conditions fails.
+
+    Runs after validate() so validation_status is already set in lineage.
+    """
+    decision = (rec.record.get("system", {})
+                .get("application", {})
+                .get("decision"))
+    complete = all([
+        rec.app_id_canonical,
+        rec.lineage.get("has_connector_data"),
+        decision is not None or rec.lineage.get("decision_missing"),
+        rec.lineage.get("validation_status") in ("PASS", "WARN"),
+    ])
+    if not complete:
+        rec.lineage["record_completeness"] = "INCOMPLETE"
+        rec.validation_failures.append("D-13-incomplete-record")
+        rec.quarantined = True
 
 
 def write_record(rec: AppRecord, cfg: ClientConfig,
@@ -1214,7 +1269,14 @@ def write_record(rec: AppRecord, cfg: ClientConfig,
         log.error("QUARANTINE %s -> %s", rec.app_id_canonical, rec.validation_failures)
         return                                          # INV-09: blocked from DataLake=Y
     assert not rec.quarantined                         # INV-09: DataLake=Y unreachable for quarantined
-    # TODO(team): real DataLake write (partitioned by client/geography/date).
+    assert rec.app_id_canonical, "INV-04: app_id_canonical null"
+    assert rec.geography in ("USA", "CAN"), f"INV-10: invalid geography {rec.geography!r}"
+    if workdir is not None:
+        out_path = Path(workdir) / "output" / rec.geography / f"{rec.app_id_canonical}.json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        if out_path.exists():
+            raise RuntimeError(f"INV-04 violation: duplicate write for {rec.app_id_canonical}")
+        out_path.write_text(json.dumps(rec.record, indent=2))
     log.info("WRITE %s (%s)", rec.app_id_canonical, rec.lineage.get("validation_status"))
 
 
@@ -1260,10 +1322,24 @@ def run_pipeline(
     cfg_base = ClientConfig.load(config_path)   # base config for manifest build
 
     root = unpack_zip(zip_path, workdir)
-    # GDS packages often have a single top-level subfolder; descend into it
-    subdirs = [p for p in root.iterdir() if p.is_dir()]
+
+    # GDS packages often have a single top-level subfolder; descend into it.
+    # Exclude pipeline-owned dirs (output/, quarantine/) so repeated runs
+    # don't confuse the single-folder heuristic on the second pass.
+    _pipeline_dirs = {"output", "quarantine"}
+    subdirs = [p for p in root.iterdir() if p.is_dir() and p.name not in _pipeline_dirs]
     if len(subdirs) == 1:
         root = subdirs[0]
+
+    # Amendment A4: clear output dir each run so stale records never persist.
+    import shutil
+    output_dir = Path(workdir) / "output"
+    quarantine_dir = Path(workdir) / "quarantine"
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True)
+    quarantine_dir.mkdir(parents=True, exist_ok=True)
+
     files = build_manifest(root, cfg_base)
 
     geo_files = dispatch_by_geo(files)          # INV-10: dispatch BEFORE scrub
@@ -1310,6 +1386,7 @@ def run_pipeline(
                 log.critical("RAW PII DETECTED %s", rec.app_id_canonical)
             build_lineage(rec, geo_cfg, str(zip_path), scrubbed, blobs)
             validate(rec, geo_cfg)                              # I3 — before write
+            _check_d13_completeness(rec)                        # D-13 — after validate
             write_record(rec, geo_cfg, workdir)
             out.append(rec)
             if rec.quarantined:

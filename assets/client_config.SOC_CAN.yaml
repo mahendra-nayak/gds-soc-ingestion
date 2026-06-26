@@ -16,8 +16,8 @@ package:
 application_id:
   source: filename_tokens
   filename:
-    pattern: <FILL:filename_regex>
-    canonical_app_id_groups: <FILL:group_names>
+    pattern: '^v\d+_(?P<geo>USA|CAN)_(?P<debtor>\d+)_(?P<dt>\d{14})(?P<test>_test)?_(?P<connector>C\d+)_.+_(?P<sequence_id>\d{7,12})_(?P<step>\d{1,4})(?:_\d+)?\.\w+$'
+    canonical_app_id_groups: [debtor, dt]
   suffix_rules:
     - suffix: _test
       action: strip
@@ -71,7 +71,13 @@ connectors:
     parse_strategy: credential_discard
 
 preprocess:
-  credential_scrub: <FILL:scrub_rules>   # list of {connector, method, ...} rules
+  credential_scrub:
+    - connector: C103403
+      method: redact
+      location: http_header_authorization
+    - connector: C161653
+      method: discard_payload
+      critical: true
   external_ref:
     size_threshold_kb: <FILL:threshold_kb>
     object_store_uri_pattern: <FILL:uri_pattern>

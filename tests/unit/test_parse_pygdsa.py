@@ -163,24 +163,25 @@ class TestAttrCountSoftWarn:
 
 
 # ---------------------------------------------------------------------------
-# TC-3: Non-base64 segment content → binascii.Error propagated
+# TC-3: Non-base64 segment content — malformed segments skipped, empty dict returned
 # ---------------------------------------------------------------------------
 class TestNonBase64Error:
-    def test_invalid_base64_raises_error(self, tmp_path):
+    def test_invalid_base64_skipped_returns_empty(self, tmp_path):
+        # Malformed base64 segments are skipped with a warning; no exception propagated
         outer = json.dumps(["!!!not-valid-base64!!!"]).encode()
         f = tmp_path / "bad.json"
         f.write_bytes(outer)
         sf = _make_sf(f)
-        with pytest.raises(binascii.Error):
-            parse_file(sf, _cfg())
+        result = parse_file(sf, _cfg())
+        assert result == {}
 
-    def test_non_base64_with_special_chars(self, tmp_path):
+    def test_non_base64_with_special_chars_skipped(self, tmp_path):
         outer = json.dumps(["<xml>not base64</xml>"]).encode()
         f = tmp_path / "bad2.json"
         f.write_bytes(outer)
         sf = _make_sf(f)
-        with pytest.raises(binascii.Error):
-            parse_file(sf, _cfg())
+        result = parse_file(sf, _cfg())
+        assert result == {}
 
 
 # ---------------------------------------------------------------------------
