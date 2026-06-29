@@ -180,3 +180,56 @@ class TestNoMatch:
 
     def test_connector_is_none(self):
         assert _sf(self.FNAME).connector is None
+
+
+# ---------------------------------------------------------------------------
+# TC-6: BUG-01 — direction fallback when regex has no direction group
+# ---------------------------------------------------------------------------
+_PROD_PATTERN = (
+    r'^v\d+_(?P<geo>USA|CAN)_(?P<debtor>\d+)_(?P<dt>\d{14})'
+    r'(?P<test>_test)?_(?P<connector>C\d+)_.+_(?P<sequence_id>\d{7,12})'
+    r'_(?P<step>\d{1,4})(?:_\d+)?\.\w+$'
+)
+
+
+def _prod_cfg() -> ClientConfig:
+    """Config using production regex — no direction named group."""
+    return ClientConfig({
+        "application_id": {
+            "source": "filename_tokens",
+            "filename": {
+                "pattern": _PROD_PATTERN,
+                "canonical_app_id_groups": ["debtor", "dt"],
+            },
+        },
+        "connectors": [],
+    })
+
+
+def _sf_prod(filename: str) -> SourceFile:
+    return _classify_file(Path(filename), folder="raw", cfg=_prod_cfg())
+
+
+class TestDirectionFallback:
+    """BUG-01: when regex has no direction group, direction is derived from filename stem."""
+
+    def test_response_in_stem_gives_resp(self):
+        fname = (
+            "v51_USA_100226802_20250707150115_C225334"
+            "_web_service_cc_response_155537657_78_3.json"
+        )
+        assert _sf_prod(fname).direction == "RESP"
+
+    def test_request_in_stem_gives_req(self):
+        fname = (
+            "v51_USA_100226802_20250707150115_C225334"
+            "_database___extracts_request_110611582_74_5.json"
+        )
+        assert _sf_prod(fname).direction == "REQ"
+
+    def test_no_direction_token_gives_none(self):
+        fname = (
+            "v51_USA_100226802_20250707150115_C78098"
+            "_gds_bureau_credit_pull_155537657_79_1.json"
+        )
+        assert _sf_prod(fname).direction is None

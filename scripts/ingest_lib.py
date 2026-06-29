@@ -678,8 +678,14 @@ def merge_sessions(rec: AppRecord, cfg: ClientConfig) -> None:
 # _scan_extra_columns_for_pii() and assert_no_raw_pii().
 _PII_PATTERNS: dict[str, re.Pattern] = {
     "email": re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}"),
-    "phone": re.compile(r"(?:\+?1[\s\-.]?)?\(?\d{3}\)?[\s\-.]?\d{3}[\s\-.]?\d{4}"),
-    "ssn":   re.compile(r"\b\d{3}[\-\s]?\d{2}[\-\s]?\d{4}\b"),
+    # (?<![A-Za-z0-9_]) prevents matching inside alphanumeric contexts:
+    #   • 14-digit timestamps (preceding char is a digit, which is in the set)
+    #   • pseudonym tokens like TOK_d4d79f4827439447 (preceding char is hex 'f')
+    # (?!\d) still blocks 10-digit substrings at the END of longer digit runs.
+    "phone": re.compile(r"(?<![A-Za-z0-9_])(?:\+?1[\s\-.]?)?\(?\d{3}\)?[\s\-.]?\d{3}[\s\-.]?\d{4}(?!\d)"),
+    # Require consistent separators: either all dashes, all spaces, or bare 9 digits.
+    # Prevents ZIP+4 (e.g. 68378-8300) from matching as 683|78|-|8300.
+    "ssn":   re.compile(r"\b(?:\d{3}([-\s])\d{2}\1\d{4}|\d{9})\b"),
     "sin":   re.compile(r"\b\d{3}[\-\s]?\d{3}[\-\s]?\d{3}\b"),
     "fein":  re.compile(r"\b\d{2}[\-]?\d{7}\b"),
 }
@@ -1037,7 +1043,7 @@ def tokenise_pii(rec: AppRecord, cfg: ClientConfig) -> None:
     """INV-02 / D-07: tokenise all static PII fields before write_record()."""
     _raw_fields = cfg.get("pii", {}).get("fields", [])
     for f in (_raw_fields if isinstance(_raw_fields, list) else []):
-        path = f.get("path", "")
+        path = f.get("sdd_path") or f.get("path", "")
         method = f.get("method", "")
         value = _get_path(rec.record, path)
         if value is None:
@@ -1388,10 +1394,10 @@ def run_pipeline(
             tokenise_pii(rec, geo_cfg)                          # I2 — before write
             try:
                 assert_no_raw_pii(rec, geo_cfg)                 # I2 — write gate
-            except RuntimeError:
+            except RuntimeError as _pii_err:
                 rec.quarantined = True
                 rec.validation_failures.append("REQ-VAL-007")
-                log.critical("RAW PII DETECTED %s", rec.app_id_canonical)
+                log.critical("RAW PII DETECTED %s: %s", rec.app_id_canonical, _pii_err)
             build_lineage(rec, geo_cfg, str(zip_path), scrubbed, blobs)
             validate(rec, geo_cfg)                              # I3 — before write
             _check_d13_completeness(rec)                        # D-13 — after validate
@@ -1462,11 +1468,38 @@ def _is_iso_utc(value: Any) -> bool:
 
 
 def _set_path(obj: dict, dotted: str, value: Any) -> None:
+    """Write value at a dotted path, creating dicts (and list stubs) as needed.
+
+    Path components ending with '[]' represent the first element of a list:
+      'applicants[].ssn'  →  obj['applicants'][0]['ssn'] = value
+    This keeps _set_path symmetric with _get_nested's [] interpretation so
+    tokenise_pii and validation rules can navigate the same structure.
+    """
     parts = dotted.split(".")
     cur = obj
     for p in parts[:-1]:
-        cur = cur.setdefault(p, {})
-    cur[parts[-1]] = value
+        if p.endswith("[]"):
+            key = p[:-2]
+            if not isinstance(cur.get(key), list):
+                cur[key] = [{}]
+            elif not cur[key]:
+                cur[key].append({})
+            if not isinstance(cur[key][0], dict):
+                cur[key][0] = {}
+            cur = cur[key][0]
+        else:
+            cur = cur.setdefault(p, {})
+    last = parts[-1]
+    if last.endswith("[]"):
+        key = last[:-2]
+        if not isinstance(cur.get(key), list):
+            cur[key] = []
+        if not cur[key]:
+            cur[key].append(value)
+        else:
+            cur[key][0] = value
+    else:
+        cur[last] = value
 
 
 def _step_nested(cur: Any, part: str) -> Any:

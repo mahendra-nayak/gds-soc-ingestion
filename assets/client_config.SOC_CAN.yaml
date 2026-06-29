@@ -83,10 +83,56 @@ preprocess:
     object_store_uri_pattern: <FILL:uri_pattern>
 
 pii:
-  fields: <FILL:pii_fields>             # list of {path, method} PII field descriptors
+  fields:
+    # Standard schema applicant PII paths
+    - { name: "firstName",    connectors: ["C225334"], method: "pseudonym_reversible",
+        sdd_path: "system.application.applicants[].firstName" }
+    - { name: "lastName",     connectors: ["C225334"], method: "pseudonym_reversible",
+        sdd_path: "system.application.applicants[].lastName" }
+    - { name: "dateOfBirth",  connectors: ["C225334"], method: "date_to_utc_iso",
+        sdd_path: "system.application.applicants[].dateOfBirth" }
+    - { name: "ssn",          connectors: ["C225334"], method: "oneway_hash",
+        sdd_path: "system.application.applicants[].ssn" }
+    - { name: "sin",          connectors: ["C225334"], method: "oneway_hash",
+        sdd_path: "system.application.applicants[].sin" }
+    - { name: "address",      connectors: ["C225334"], method: "pseudonym_reversible",
+        sdd_path: "system.application.applicants[].address" }
+    - { name: "phoneNumber",  connectors: ["C225334"], method: "pseudonym_reversible",
+        sdd_path: "system.application.applicants[].phoneNumber" }
+    - { name: "emailAddress", connectors: ["C225334"], method: "pseudonym_reversible",
+        sdd_path: "system.application.applicants[].emailAddress" }
+    # Vendor-prefixed applicant PII (C225334 raw field names also written to record)
+    - { name: "Applicant_SSN",          sdd_path: "system.application.applicants[].Applicant_SSN",          method: "oneway_hash" }
+    - { name: "Applicant_DebtorNumber", sdd_path: "system.application.applicants[].Applicant_DebtorNumber", method: "scrub_never_store" }
+    - { name: "Applicant_FirstName",    sdd_path: "system.application.applicants[].Applicant_FirstName",    method: "pseudonym_reversible" }
+    - { name: "Applicant_LastName",     sdd_path: "system.application.applicants[].Applicant_LastName",     method: "pseudonym_reversible" }
+    - { name: "Applicant_MiddleName",   sdd_path: "system.application.applicants[].Applicant_MiddleName",   method: "pseudonym_reversible" }
+    - { name: "Applicant_DateOfBirth",  sdd_path: "system.application.applicants[].Applicant_DateOfBirth",  method: "year_only" }
+    - { name: "Applicant_EmployerPhone",sdd_path: "system.application.applicants[].Applicant_EmployerPhone",method: "pseudonym_reversible" }
+    # Contact information PII
+    - { name: "ApplicantContact_Email", sdd_path: "system.application.applicants[].contactInformation[].ApplicantContact_Email", method: "pseudonym_reversible" }
+    - { name: "ApplicantContact_Phone", sdd_path: "system.application.applicants[].contactInformation[].ApplicantContact_Phone", method: "pseudonym_reversible" }
+    - { name: "contactInfo_value",      sdd_path: "system.application.applicants[].contactInformation[].value",                  method: "pseudonym_reversible" }
+    # Business / business-address contact PII
+    - { name: "business_contactName",   sdd_path: "system.application.applicants[].business[].contactName",                              method: "pseudonym_reversible" }
+    - { name: "BusinessOwner_Name",     sdd_path: "system.application.applicants[].business[].BusinessOwner_Name",                       method: "pseudonym_reversible" }
+    - { name: "bizAddr_contactPhone",   sdd_path: "system.application.applicants[].business[].businessAddresses[].contactPhone",         method: "pseudonym_reversible" }
+    - { name: "bizAddr_contactName",    sdd_path: "system.application.applicants[].business[].businessAddresses[].contactName",          method: "pseudonym_reversible" }
+    # Address PII
+    - { name: "Addr_Phone",             sdd_path: "system.application.applicants[].addresses[].Addr_Phone",         method: "pseudonym_reversible" }
+    - { name: "Addr_ContactName",       sdd_path: "system.application.applicants[].addresses[].Addr_ContactName",   method: "pseudonym_reversible" }
+    - { name: "addr_contactPhone",      sdd_path: "system.application.applicants[].addresses[].contactPhone",       method: "pseudonym_reversible" }
+    # Employment PII
+    - { name: "emp_EmployerContact",    sdd_path: "system.application.applicants[].employmentDetails[].ApplicantEmployment_EmploymentContact", method: "pseudonym_reversible" }
+    - { name: "emp_employerContact",    sdd_path: "system.application.applicants[].employmentDetails[].employerContact",                       method: "pseudonym_reversible" }
+    # CAN bureau data blobs — raw XML/text from TransUnion; cannot be field-parsed until Q-FFF resolved.
+    # IC-4/IC-5: must not persist raw bureau PII; scrub the blob fields entirely.
+    - { name: "tuca_xml_report", sdd_path: "system.application.applicants[].dataSources[].reports[].TUCONSCA_XMLReport", method: "scrub_never_store" }
+    - { name: "tuca_report",     sdd_path: "system.application.applicants[].dataSources[].reports[].report",             method: "scrub_never_store" }
+    - { name: "tuca_tty",        sdd_path: "system.application.applicants[].dataSources[].reports[].TUCONSCA_TTY",       method: "scrub_never_store" }
   extra_columns_scan:
-    enabled: false
-    patterns: []
+    enabled: true
+    patterns: ["ssn", "sin", "email", "phone", "fein"]
 
 extra_columns_groups:
   - name: SOC_pygdsa_attributes

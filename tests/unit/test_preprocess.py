@@ -17,7 +17,7 @@ TC-10 (normalise_encoding): connector code appears in ValueError message
 import gzip
 import pytest
 
-from scripts.ingest_lib import http_envelope_strip, maybe_gunzip, normalise_encoding
+from scripts.ingest_lib import http_envelope_strip, maybe_gunzip, normalise_encoding, _to_utc_iso
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +53,12 @@ class TestHttpEnvelopeStrip:
         )
         result = http_envelope_strip(raw)
         assert result == b"actual body content"
+
+    def test_lf_only_separator_extracted(self):
+        """BUG-02: C225334 response files use LF-only (\\n\\n) instead of CRLFCRLF."""
+        raw = b"HTTP Code: 200\nHTTP Headers:\n\n{\"record\": 1}"
+        result = http_envelope_strip(raw)
+        assert result == b'{"record": 1}'
 
     def test_returns_bytes(self):
         raw = b"H: v\r\n\r\nbody"
@@ -142,3 +148,42 @@ class TestNormaliseEncoding:
         body = "hello".encode("utf-8")
         result = normalise_encoding(body, "C161653", target="utf-8")
         assert result == b"hello"
+
+
+# ---------------------------------------------------------------------------
+# BUG-03 — _to_utc_iso: timezone offset normalisation and naive datetime fix
+# ---------------------------------------------------------------------------
+class TestToUtcIso:
+    def test_offset_no_colon_normalised(self):
+        """BUG-03a: +HHMM (no colon) must be accepted and converted to UTC ISO."""
+        result = _to_utc_iso("2025-04-22T11:06:40+0000")
+        assert result is not None
+        assert result.startswith("2025-04-22T11:06:40")
+
+    def test_offset_with_colon_accepted(self):
+        result = _to_utc_iso("2025-04-22T11:06:40+00:00")
+        assert result is not None
+        assert result.startswith("2025-04-22T11:06:40")
+
+    def test_compact_datetime_format(self):
+        """YYYYMMDDHHMMSS strptime format."""
+        result = _to_utc_iso("20250422110640")
+        assert result is not None
+        assert "2025-04-22" in result
+        assert "11:06:40" in result
+
+    def test_us_date_format(self):
+        """MM/DD/YYYY strptime format."""
+        result = _to_utc_iso("04/22/2025")
+        assert result is not None
+        assert "2025-04-22" in result
+
+    def test_naive_datetime_hour_preserved(self):
+        """BUG-03b: naive datetime must get UTC assigned, not shifted by local tz."""
+        result = _to_utc_iso("2025-04-22T11:06:40")
+        assert result is not None
+        # Hour must be 11, not shifted by the local timezone offset.
+        assert result.startswith("2025-04-22T11:06:40")
+
+    def test_unrecognised_format_returns_none(self):
+        assert _to_utc_iso("not-a-date") is None
